@@ -1,0 +1,192 @@
+
+
+
+MaAsLin2_species_barplot.pdf
+```{r}
+
+# Species-level MaAsLin2 coefficient plot
+# This script generates the species-level summary figure
+# from the differential-abundance results produced by
+# Microbiome_MaAsLin2.Rmd.
+
+library(dplyr)
+library(ggplot2)
+library(readxl)
+library(stringr)
+
+# ==============================
+#Read combined MaAsLin2 output
+# ==============================
+base_dir <- "Maaslin2_output_no13"
+
+df <- read_excel(
+  file.path(base_dir, "Maaslin2_Combined_TaxLevels_SampleType.xlsx"),
+  sheet = "All_SampleType_Associations"
+)
+
+# ==============================
+#Filter species-level significant results
+# ==============================
+df_species <- df %>%
+  filter(Level == "Species", qval <= 0.25) %>%
+  mutate(
+    species = feature %>%
+      str_replace("^s_", "") %>%
+      str_replace("^s__", "") %>%
+      str_replace_all("_", " "),
+    abs_coef = abs(coef),
+    Group = factor(value, levels = c("ALC", "CB", "ALC+CB")),
+    Direction = ifelse(coef > 0, "Increased", "Decreased")
+  ) %>%
+  filter(!grepl("^Other", species))
+
+# ==============================
+# Create output directory
+# ==============================
+output_dir <- file.path(base_dir, "MaAsLin2_LDAfig_species")
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Save filtered full table
+write.csv(
+  df_species,
+  file.path(output_dir, "MaAsLin2_species_filtered.csv"),
+  row.names = FALSE
+)
+
+# ==============================
+# Select top taxa by absolute effect size
+# ==============================
+top_species <- df_species %>%
+  arrange(desc(abs_coef)) %>%
+  slice_head(n = 20) %>%
+  arrange(coef)
+
+write.csv(
+  top_species,
+  file.path(output_dir, "MaAsLin2_top_species.csv"),
+  row.names = FALSE
+)
+
+# ==============================
+# Plot: signed coefficient + colored by group
+# ==============================
+
+p <- ggplot(
+  top_species,
+  aes(
+    x = coef,
+    y = reorder(species, coef),
+    fill = Group
+  )
+) +
+  geom_col(width = 0.8) +
+  geom_vline(xintercept = 0, linewidth = 0.7, color = "black") +
+  scale_fill_manual(
+    values = c(
+      "ALC" = "#E45756",
+      "CB" = "#4C78A8",
+      "ALC+CB" = "#72B7B2"
+    ),
+    labels = c(
+      "ALC" = "Alcohol",
+      "CB" = "Cannabinoid",
+      "ALC+CB" = "Alcohol + Cannabinoid"
+    )
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.y = element_text(face = "italic", size = 13),
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    legend.position = "top",
+    legend.text = element_text(size = 13),
+    plot.title = element_text(
+      face = "bold",
+      size = 14,
+      hjust = 0.5
+    )
+  ) +
+  labs(
+    title = "Top Differentially Abundant Species by MaAsLin2 (q ≤ 0.25)",
+    x = "MaAsLin2 effect size coefficient",
+    y = NULL,
+    fill = NULL
+  )
+
+print(p)
+
+ggsave(
+  file.path(output_dir, "MaAsLin2_species_barplot_by_group.pdf"),
+  plot = p,
+  width = 7.5,
+  height = 6
+)
+
+# ==============================
+# Highlight selected SCFA-related taxa
+# ==============================
+
+butyrate_taxa <- c(
+  "Faecalibacterium prausnitzii D",
+  "Gemmiger formicilis",
+  "Roseburia hominis"
+)
+
+other_scfa_taxa <- c(
+  "Blautia A wexlerae",
+  "Blautia coccoides A",
+  "Dorea muris"
+)
+
+top_species <- top_species %>%
+  mutate(
+    species_factor = factor(species, levels = unique(species[order(coef)]))
+  )
+
+label_colors <- case_when(
+  levels(top_species$species_factor) %in% butyrate_taxa ~ "#1f4e79",
+  levels(top_species$species_factor) %in% other_scfa_taxa ~ "#7A3E9D",
+  TRUE ~ "black"
+)
+
+p_highlight <- ggplot(
+  top_species,
+  aes(
+    x = coef,
+    y = species_factor,
+    fill = Group
+  )
+) +
+  geom_col(width = 0.9) +
+  geom_vline(xintercept = 0, linewidth = 0.6, color = "black") +
+  scale_fill_manual(
+    values = c(
+      "ALC" = "#E45756",
+      "CB" = "#4C78A8",
+      "ALC+CB" = "#72B7B2"
+    )
+  ) +
+  theme_classic(base_size = 16) +
+  theme(
+    axis.text.y = element_text(face = "italic", color = label_colors),
+    legend.position = "top"
+  ) +
+  labs(
+    x = "MaAsLin2 coefficient",
+    y = NULL,
+    fill = NULL
+  )
+
+print(p_highlight)
+
+ggsave(
+  file.path(output_dir, "MaAsLin2_species_barplot_by_group_highlight.pdf"),
+  plot = p_highlight,
+  width = 7,
+  height = 6
+)
+```
+
