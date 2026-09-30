@@ -1,0 +1,985 @@
+---
+title: "QC_Microbiome_Alpha_Beta_RelativeAbundance"
+author: "Deepa Upreti"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# 1. Load packages
+library(phyloseq)
+library(ggplot2)
+library(dplyr)
+library(vegan)
+library(RColorBrewer)
+library(openxlsx)
+library(readr)
+library(plotly)
+library(viridisLite)
+library(htmlwidgets)
+library(patchwork)
+library(scales)
+
+
+# 2. Import data 
+#Input files
+otu_file  <- "taxatable-filtered-absolute_w_taxonomy.txt" 
+meta_file <- "metadata.tsv"
+
+# Read taxonomy/count table
+# Taxonomy strings are stored in the first column/row names
+taxatable <- read.table(
+  otu_file,
+  header = TRUE,
+  sep = "\t",
+  row.names = 1,
+  check.names = FALSE
+)
+
+# Inspect column names
+head(colnames(taxatable))
+
+#  Remove the "OTU ID" column (second column)
+taxatable <- taxatable[, -1]
+
+# 3. Separate count and taxonomy information
+#  Extract counts and taxonomy
+otu_counts <- taxatable[, sapply(taxatable, is.numeric)]  # Counts only
+taxonomy_strings <- rownames(taxatable)         # Taxonomy strings are rownames
+
+#  Split taxonomy into hierarchical levels
+tax_split <- data.frame(do.call(rbind, strsplit(taxonomy_strings, ";\\s*")))
+colnames(tax_split) <- c("Kingdom","Phylum","Class","Order","Family","Genus","Species","Strain")[1:ncol(tax_split)]
+rownames(tax_split) <- rownames(otu_counts)
+
+#4. Import and align sample metadata
+meta <- read.table(
+  meta_file,
+  header = TRUE,
+  row.names = 1,
+  sep = "\t",
+  check.names = FALSE
+)
+head(meta)
+
+# Check for unmatched sample IDs
+setdiff(colnames(otu_counts), rownames(meta))
+setdiff(rownames(meta), colnames(otu_counts))
+
+common_samples <- intersect(colnames(otu_counts), rownames(meta))
+
+otu_counts <- otu_counts[, common_samples, drop = FALSE]
+meta <- meta[common_samples, , drop = FALSE]
+
+stopifnot(identical(colnames(otu_counts), rownames(meta)))
+```
+
+```{r}
+#5. Build phyloseq object
+ps <- phyloseq(
+  otu_table(as.matrix(otu_counts), taxa_are_rows = TRUE),
+  tax_table(as.matrix(tax_split)),
+  sample_data(meta)
+)
+
+# Quick check
+ps
+
+#Quick integrity check for OTU–metadata alignment
+
+cat("Number of taxa:", ntaxa(ps), "\nNumber of samples:", nsamples(ps), "\n\n")
+
+# Show any sample names that don't match (should be empty)
+setdiff(colnames(otu_table(ps)), rownames(sample_data(ps)))
+
+# Confirm sample sums (none should be 0)
+summary(sample_sums(ps))
+# Confirm OTU and metadata sample IDs match
+identical(sort(colnames(otu_table(ps))), sort(rownames(sample_data(ps))))
+```
+
+```{r}
+# ============================================
+# Rename exposure groups
+# ============================================
+
+sample_data(ps)$SampleType <- dplyr::recode(
+  as.character(sample_data(ps)$SampleType),
+  "Control" = "CON",
+  "PAE"     = "ALC",
+  "CBD"     = "CB",
+  "SAC"     = "ALC+CB"
+)
+
+sample_data(ps)$SampleType <- factor(
+  sample_data(ps)$SampleType,
+  levels = c("CON", "ALC", "CB", "ALC+CB")
+)
+
+# Verify group labels and sample numbers
+table(sample_data(ps)$SampleType)
+```
+
+
+Sequencing depth on the basis of Treatment
+```{r}
+depth_df <- data.frame(
+  Sample = sample_names(ps),
+  Reads  = sample_sums(ps),
+  Group  = sample_data(ps)$SampleType  # change 'Group' to your metadata variable name
+)
+
+ggplot(depth_df, aes(x = Group, y = Reads, fill = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.6) +
+  theme_bw(base_size = 13) +
+  ylab("Sequencing depth (reads)") +
+  ggtitle("Library size per sample")
+
+summary(sample_sums(ps))
+# Check variability ratio
+cat("Max/Min read-depth ratio:", max(sample_sums(ps)) / min(sample_sums(ps)), "\n")
+
+
+# Sort by total reads
+depth_df_sorted <- depth_df[order(depth_df$Reads, decreasing = TRUE), ]
+head(depth_df_sorted, 5)   # top 5 most-sequenced
+tail(depth_df_sorted, 5)   # bottom 5 least-sequenced
+
+ggplot(depth_df, aes(x = "", y = Reads)) +
+  geom_boxplot(outlier.shape = NA, fill = "skyblue") +
+  geom_jitter(width = 0.1, alpha = 0.6) +
+  scale_y_log10() +
+  theme_bw(base_size = 13) +
+  ylab("Reads (log10)") +
+  ggtitle("Sequencing depth per sample")
+
+```
+
+Outlier detection by sequencing depth
+```{r}
+
+# Create a data frame of sample depths
+depth_df <- data.frame(
+  Sample = sample_names(ps),
+  Reads  = sample_sums(ps),
+  Group  = sample_data(ps)$SampleType  # change to your grouping variable
+)
+
+# Calculate mean and standard deviation
+mean_depth <- mean(depth_df$Reads)
+sd_depth   <- sd(depth_df$Reads)
+
+
+# Flag samples with sequencing depth > mean + 2 SD
+depth_df$Outlier <- depth_df$Reads > (mean_depth + 2 * sd_depth)
+
+
+# Show flagged samples
+cat("Samples flagged by sequencing-depth criterion (>2 SD above mean):\n")
+print(
+  depth_df[
+    depth_df$Outlier,
+    c("Sample", "Reads", "Group")
+  ]
+)
+
+# Store flagged sample IDs for QC review
+outlier_samples <- depth_df$Sample[depth_df$Outlier]
+outlier_samples
+```
+
+
+# Additional sample-level QC diagnostics
+```{r}
+# Bray-Curtis distance-based outlier detection
+# Identifies samples that are unusually dissimilar from the overall dataset.
+
+ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+bray <- phyloseq::distance(ps_rel, method = "bray")
+
+# Average distance of each sample to all others
+bray_mat <- as.matrix(bray)
+avg_dist <- rowMeans(bray_mat)
+
+# Convert to z-scores
+z_dist <- scale(avg_dist)
+
+# Flag samples > 3 SD
+outliers_dist <- names(z_dist[abs(z_dist) > 3])
+outliers_dist
+
+# Ordination-based outlier detection
+ord <- ordinate(ps_rel, method="PCoA", distance=bray)
+
+coords <- ord$vectors[,1:3]   # first 3 axes
+centroid <- colMeans(coords)
+dist_centroid <- sqrt(rowSums((coords - centroid)^2))
+
+z_ord <- scale(dist_centroid)
+
+outliers_ord <- names(z_ord[abs(z_ord) > 3])
+outliers_ord
+
+
+#Alpha diversity outlier detection
+# Extreme richness/evenness indicates artifact.
+alpha <- estimate_richness(ps, measures=c("Observed","Shannon"))
+alpha$z_shannon <- scale(alpha$Shannon)
+alpha$z_observed <- scale(alpha$Observed)
+
+alpha_outliers <- rownames(alpha)[
+  abs(alpha$z_shannon) > 3 | abs(alpha$z_observed) > 3
+]
+alpha_outliers
+
+#Detect if one taxon dominates abnormally (Dominance / contamination signal)
+otu <- as(otu_table(ps), "matrix")
+if (!taxa_are_rows(ps)) otu <- t(otu)
+
+rel <- sweep(otu, 2, colSums(otu), "/")
+max_rel <- apply(rel, 2, max)
+
+z_dom <- scale(max_rel)
+outliers_dom <- names(z_dom[abs(z_dom) > 3])
+outliers_dom
+
+
+#COMBINE QC results (Summary)
+outlier_summary <- data.frame(
+  Sample = sample_names(ps),
+  BrayOutlier = sample_names(ps) %in% outliers_dist,
+  OrdOutlier  = sample_names(ps) %in% outliers_ord,
+  AlphaOutlier = sample_names(ps) %in% alpha_outliers,
+  DominanceOutlier = sample_names(ps) %in% outliers_dom
+)
+
+outlier_summary$TotalFlags <- rowSums(outlier_summary[,2:5])
+outlier_summary[order(outlier_summary$TotalFlags, decreasing=TRUE),]
+
+###NOTE: One sample exhibited extreme sequencing depth (~23 million reads), exceeding the next highest sample by more than fivefold and resulting in substantial library size imbalance (Max/Min = 27.5; CV = 1.23). To maintain comparable sequencing depth across samples and minimize technical bias, this sample was excluded prior to downstream diversity and differential abundance analyses. Key findings were consistent when analyses were performed with and without this sample.
+#| Metric                        | Full dataset (n=65) | After removal (n=64) |
+#| ----------------------------- | ------------------- | -------------------- |
+#| Minimum reads                 | 856,108             | 856,108              |
+#| Median reads                  | 1,815,354           | 1,803,071            |
+#| Mean reads                    | 2,278,197           | 1,945,608            |
+#| Maximum reads                 | **23,563,850**      | 4,292,139            |
+#| Max / Min ratio               | **27.5**            | 5.01                 |
+#| Coefficient of variation (CV) | **1.23**            | 0.41                 |
+
+```
+
+
+```{r}
+# ============================================
+# Final sample exclusion
+# ============================================
+
+# MICE.SEQ13 was excluded from downstream analyses because of
+# extreme sequencing depth and substantial library-size imbalance.
+
+ps_filtered <- prune_samples(
+  sample_names(ps) != "MICE.SEQ13",
+  ps
+)
+
+# Confirm that the intended sample was removed
+stopifnot(!("MICE.SEQ13" %in% sample_names(ps_filtered)))
+
+# Confirm that exactly one sample was removed
+stopifnot(nsamples(ps_filtered) == nsamples(ps) - 1)
+
+cat(
+  "Samples before QC exclusion:", nsamples(ps),
+  "\nSamples after QC exclusion:", nsamples(ps_filtered),
+  "\n"
+)
+```
+
+
+
+ALPHA and BETA DIVERSITY  (Sample no.13 removed)
+
+#ALPHA DIVERSITY
+```{r}
+
+alpha_beta_dir <- "Microbiome_Alpha_Beta_Output"
+
+if (!dir.exists(alpha_beta_dir)) {
+  dir.create(alpha_beta_dir)
+}
+
+# ============================================
+# Alpha diversity
+# MICE.SEQ13 excluded based on sequencing-depth QC
+# Alpha-diversity metrics are calculated from raw counts.
+# ============================================
+ps_alpha<-ps_filtered
+
+
+# Compute alpha-diversity indices
+alpha_df <- estimate_richness(
+  ps_alpha,
+  measures = c("Observed", "Chao1", "Shannon", "Simpson")
+)
+
+# Add sample metadata
+alpha_df$SampleID   <- rownames(alpha_df)
+alpha_df$SampleType <- as.vector(sample_data(ps_alpha)$SampleType)
+
+alpha_df$Sex <- if ("Sex" %in% colnames(sample_data(ps_alpha))) {
+  as.vector(sample_data(ps_alpha)$Sex)
+} else {
+  NA
+}
+###Quality check if the samples are in same order
+nsamples(ps_alpha)
+nrow(alpha_df)
+
+identical(sample_names(ps_alpha), alpha_df$SampleID)
+
+all(alpha_df$SampleID %in% sample_names(ps_alpha))
+"MICE.SEQ13" %in% sample_names(ps_alpha) #check sample is removed; should come False
+
+
+# Reorder columns (GraphPad-friendly)
+alpha_df <- alpha_df[, c(
+  "SampleID", "SampleType", "Sex",
+  "Observed", "Chao1", "Shannon", "Simpson"
+)]
+
+# Set desired order
+alpha_df$SampleType <- factor(alpha_df$SampleType, levels = c("CON","ALC","CB","ALC+CB"))
+alpha_df$Sex <- factor(alpha_df$Sex, levels = c("M","F"))
+alpha_df <- alpha_df[order(alpha_df$SampleType, alpha_df$Sex), ]
+
+# Sanity check (should show 4 groups)
+table(alpha_df$SampleType, useNA="ifany")
+
+
+# Export for GraphPad Prism
+write.csv(
+  alpha_df,
+  file.path(alpha_beta_dir, "Alpha_Diversity_Raw_counts_no13.csv"),
+  row.names = FALSE
+)
+
+summary(sample_sums(ps_alpha))
+
+
+# ---- Alpha diversity plots ----
+
+p_shannon <- ggplot(alpha_df, aes(x = SampleType, y = Shannon, fill = SampleType)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.15, alpha = 0.6, size = 2) +
+  theme_bw(base_size = 13) +
+  ylab("Shannon diversity index") +
+  xlab("") +
+  ggtitle("Alpha diversity (Shannon)") +
+  theme(legend.position = "none")
+
+p_obs <- ggplot(alpha_df, aes(x = SampleType, y = Observed, fill = SampleType)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.15, alpha = 0.6, size = 2) +
+  theme_bw(base_size = 13) +
+  ylab("Observed richness") +
+  xlab("") +
+  ggtitle("Alpha diversity (Observed)") +
+  theme(legend.position = "none")
+
+p_chao1 <- ggplot(alpha_df, aes(x = SampleType, y = Chao1, fill = SampleType)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.15, alpha = 0.6, size = 2) +
+  theme_bw(base_size = 13) +
+  ylab("Chao1 richness estimate") +
+  xlab("") +
+  ggtitle("Alpha diversity (Chao1)") +
+  theme(legend.position = "none")
+
+p_alpha_all <- p_obs | p_chao1 | p_shannon
+p_alpha_all
+
+ggsave(
+  file.path(alpha_beta_dir, "Alpha_Diversity_Observed_Chao1_Shannon_no13.pdf"),
+  plot     = p_alpha_all,
+  width    = 12,
+  height   = 4,
+  units    = "in"
+)
+
+ggsave(
+  file.path(alpha_beta_dir, "Alpha_Shannon_no13.pdf"),
+  p_shannon, width = 5, height = 4
+)
+ggsave(
+  file.path(alpha_beta_dir, "Alpha_Observed_no13.pdf"),
+  p_obs, width = 5, height = 4
+)
+ggsave(
+  file.path(alpha_beta_dir, "Alpha_Chao1_no13.pdf"),
+  p_chao1, width = 5, height = 4
+)
+
+table(alpha_df$SampleType)
+
+
+###Quality check
+# 1) sample removed?
+"MICE.SEQ13" %in% sample_names(ps_alpha)     # should be FALSE
+
+# 2) group counts look reasonable (not all NA, not 1 group)
+table(alpha_df$SampleType, useNA="ifany")    # should show Control/PAE/CBD/SAC
+
+# 3) Sex counts okay
+table(alpha_df$Sex, useNA="ifany")           # should show M/F (and ideally no NAs)
+
+```
+
+# Sequencing-depth QC summary
+```{r}
+
+depth_qc_summary <- function(ps_obj) {
+  d <- sample_sums(ps_obj)
+  c(
+    n_samples = nsamples(ps_obj),
+    min_reads = min(d),
+    median_reads = median(d),
+    mean_reads = mean(d),
+    max_reads = max(d),
+    max_min_ratio = max(d) / min(d),
+    cv = sd(d) / mean(d)
+  )
+}
+
+qc_allsamples <- depth_qc_summary(ps)
+qc_removeno13 <- depth_qc_summary(ps_filtered)
+
+qc_table <- data.frame(
+  Metric = names(qc_allsamples),
+ All_samples = qc_allsamples,
+  Removed_no13sample = qc_removeno13 
+)
+
+qc_table
+
+###Table format
+qc_table$All_samples  <- round(qc_table$All_samples, 2)
+qc_table$Removed_no13sample <- round(qc_table$Removed_no13sample, 2)
+
+qc_table
+
+write.csv(qc_table,
+          file.path(alpha_beta_dir, "SequencingDepth_QC_table_no13.csv"),
+          row.names = FALSE)
+```
+
+Sequencing depth outlier plot
+
+```{r}
+depth_df <- data.frame(
+  Sample = sample_names(ps),
+  Reads  = sample_sums(ps),
+  Sex    = sample_data(ps)$Sex
+)
+
+depth_df$Outlier <- ifelse(depth_df$Sample == "MICE.SEQ13", "Outlier", "Other")
+
+p_depth <- ggplot(depth_df, aes(x = "", y = Reads)) +
+  geom_boxplot(outlier.shape = NA, fill = "grey85") +
+  geom_jitter(aes(color = Outlier), width = 0.08, size = 3) +
+  scale_color_manual(values = c("Outlier" = "red", "Other" = "black")) +
+  scale_y_log10() +
+  theme_bw(base_size = 14) +
+  ylab("Sequencing depth (reads, log10 scale)") +
+  xlab("") +
+  ggtitle("Sequencing depth across samples") +
+  theme(
+    legend.title = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+# Save figure
+ggsave(file.path(alpha_beta_dir,
+  "Sequencing_depth_outlier_plot.pdf"),
+  plot = p_depth,
+  width = 6,
+  height = 5
+)
+
+p_sex_depth <- ggplot(depth_df, aes(x = Sex, y = Reads, fill = Sex)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(aes(color = Outlier), width = 0.15, size = 3) +
+  scale_color_manual(values = c("Outlier" = "red", "Other" = "black")) +
+  scale_y_log10() +
+  theme_bw(base_size = 14) +
+  ylab("Sequencing depth (reads, log10 scale)") +
+  ggtitle("Sequencing depth by sex") +
+  theme(
+    legend.title = element_blank()
+  )
+
+
+# Save figure
+ggsave(file.path(alpha_beta_dir,
+  "Sequencing_depth_outlier_bySex.pdf"),
+  plot = p_sex_depth,
+  width = 6,
+  height = 5
+)
+p_sex_depth
+```
+
+```{r}
+# ============================================
+# Beta Diversity (Bray–Curtis, sample 13 removed)
+# ============================================
+# --------------------------------------------
+# Use filtered dataset (sample 13 removed)
+# --------------------------------------------
+ps_beta <- ps_filtered
+
+# Verify removal
+"MICE.SEQ13" %in% sample_names(ps_beta)
+
+# --------------------------------------------
+# Normalize to relative abundance
+# --------------------------------------------
+ps_rel <- transform_sample_counts(ps_beta, function(x) x / sum(x))
+
+# --------------------------------------------
+# Bray–Curtis distance
+# --------------------------------------------
+bray_dist <- phyloseq::distance(ps_rel, method = "bray")
+
+# --------------------------------------------
+# PCoA ordination
+# --------------------------------------------
+ord <- ordinate(ps_rel, method = "PCoA", distance = bray_dist)
+
+# Percent variance explained
+eigvals <- ord$values$Eigenvalues
+var_exp <- round(100 * eigvals / sum(eigvals), 2)
+
+# --------------------------------------------
+# 2D PCoA plot
+# --------------------------------------------
+p_beta2D <- plot_ordination(ps_rel, ord, color = "SampleType") +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(aes(color = SampleType),
+               type = "t",
+               linetype = 2,
+               linewidth = 1) +
+  labs(
+    x = paste0("PCoA1 (", var_exp[1], "%)"),
+    y = paste0("PCoA2 (", var_exp[2], "%)")
+  ) +
+  theme_bw(base_size = 13) +
+  ggtitle("Beta diversity (Bray–Curtis)") +
+  theme(legend.position = "right")
+
+p_beta2D
+
+# Save 2D PCoA
+ggsave(
+  file.path(alpha_beta_dir,"Beta_Diversity_PCoA_BrayCurtis_no13.pdf"),
+  plot = p_beta2D,
+  width = 6,
+  height = 5
+)
+
+# --------------------------------------------
+# PERMANOVA
+# --------------------------------------------
+meta_df <- data.frame(sample_data(ps_rel))
+
+set.seed(123)
+
+perm <- adonis2(
+  bray_dist ~ Sex + SampleType,
+  data = meta_df,
+  permutations = 999,
+  by = "terms"
+)
+
+print(perm)
+
+# --------------------------------------------
+# Dispersion test
+# --------------------------------------------
+disp <- betadisper(bray_dist, meta_df$SampleType)
+
+anova(disp)
+permutest(disp, permutations = 999)
+
+# --------------------------------------------
+# Combine Alpha + Beta
+# --------------------------------------------
+p_combined <- (p_alpha_all | p_beta2D) +
+  plot_annotation(title = "Alpha and Beta Diversity Overview (Sample 13 removed)")
+
+p_combined
+
+ggsave(
+  file.path(alpha_beta_dir,"Alpha_Beta_Diversity_Plots_no13.pdf"),
+  plot = p_combined,
+  width = 12,
+  height = 5
+)
+
+# --------------------------------------------
+# Save Bray–Curtis matrix
+# --------------------------------------------
+write.csv(
+  as.matrix(bray_dist),
+  file.path(alpha_beta_dir, "BrayCurtis_Distance_Matrix.csv")
+)
+
+# ============================================
+# 3D PCoA Visualization
+# ============================================
+
+ord_df <- data.frame(
+  Axis1 = ord$vectors[,1],
+  Axis2 = ord$vectors[,2],
+  Axis3 = ord$vectors[,3],
+  SampleType = meta_df$SampleType,
+  SampleID = rownames(meta_df)
+)
+
+cols <- viridisLite::plasma(length(unique(ord_df$SampleType)))
+
+p_beta3D <- plot_ly(
+  data = ord_df,
+  x = ~Axis1,
+  y = ~Axis2,
+  z = ~Axis3,
+  color = ~SampleType,
+  colors = cols,
+  type = "scatter3d",
+  mode = "markers",
+  text = ~SampleID,
+  marker = list(size = 6, opacity = 0.85)
+) %>%
+  layout(
+    title = "3D PCoA (Bray–Curtis)",
+    scene = list(
+      xaxis = list(title = paste0("PCoA1 (", var_exp[1], "%)")),
+      yaxis = list(title = paste0("PCoA2 (", var_exp[2], "%)")),
+      zaxis = list(title = paste0("PCoA3 (", var_exp[3], "%)"))
+    )
+  )
+
+p_beta3D
+
+saveWidget(
+  p_beta3D,
+  file.path(alpha_beta_dir, "Beta_PCoA_3D.html"),
+  selfcontained = TRUE
+)
+```
+
+Sex-based Bray–Curtis PCoA (2D)
+```{r}
+# ============================================
+# Beta Diversity by Sex
+# ============================================
+
+# Use same normalized dataset
+ps_rel_sex <- ps_rel
+
+# Bray–Curtis distance
+bray_sex <- phyloseq::distance(ps_rel_sex, method = "bray")
+
+# PCoA ordination
+ord_sex <- ordinate(ps_rel_sex, method = "PCoA", distance = bray_sex)
+
+# Percent variance explained
+eigvals_sex <- ord_sex$values$Eigenvalues
+var_exp_sex <- round(100 * eigvals_sex / sum(eigvals_sex), 2)
+
+# Plot
+p_beta_sex <- plot_ordination(ps_rel_sex, ord_sex,
+                              color = "Sex") +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(aes(color = Sex),
+               type = "t",
+               linetype = 2,
+               linewidth = 1) +
+  labs(
+    x = paste0("PCoA1 (", var_exp_sex[1], "%)"),
+    y = paste0("PCoA2 (", var_exp_sex[2], "%)")
+  ) +
+  theme_bw(base_size = 13) +
+  ggtitle("Beta diversity by Sex (Bray–Curtis)") +
+  theme(legend.position = "right")
+
+p_beta_sex
+
+# Save figure
+ggsave(
+  file.path(alpha_beta_dir,"Beta_Diversity_PCoA_Sex_BrayCurtis_no13.pdf"),
+  plot = p_beta_sex,
+  width = 6,
+  height = 5
+)
+```
+
+Separate PCA plot (Pairwise bray-curtis and Permanova and include sex)
+```{r}
+
+# Pairwise PCoA function with q-value support
+pairwise_pcoa_plot <- function(ps_obj, group1, group2, q_val = NA){
+
+  meta_full <- data.frame(sample_data(ps_obj))
+
+  keep_samples <- rownames(meta_full)[
+    meta_full$SampleType %in% c(group1, group2)
+  ]
+
+  ps_sub <- prune_samples(keep_samples, ps_obj)
+
+  ps_rel <- transform_sample_counts(ps_sub, function(x) x / sum(x))
+
+  bray <- phyloseq::distance(ps_rel, method = "bray")
+
+  ord <- ordinate(ps_rel, method = "PCoA", distance = bray)
+
+  eigvals <- ord$values$Eigenvalues
+  var_exp <- round(100 * eigvals / sum(eigvals), 2)
+
+  meta <- data.frame(sample_data(ps_rel))
+
+  perm <- adonis2(
+  bray ~ Sex + SampleType,
+  data = meta,
+  permutations = 999,
+  by = "terms"
+)
+  R2_val <- perm["SampleType", "R2"]
+p_val  <- perm["SampleType", "Pr(>F)"]
+
+# PERMANOVA uses permutation testing to assess differences in
+# multivariate community composition based on Bray-Curtis distances.
+
+  if(!is.na(q_val)){
+    label_text <- paste0(
+      "R² = ", sprintf("%.3f", R2_val),
+      "\nq = ", sprintf("%.4f", q_val)
+    )
+  } else {
+    label_text <- paste0(
+      "R² = ", sprintf("%.3f", R2_val),
+      "\np = ", signif(p_val, 3)
+    )
+  }
+
+  ord_df <- data.frame(
+    Axis1 = ord$vectors[,1],
+    Axis2 = ord$vectors[,2],
+    SampleType = meta$SampleType,
+    Sex = meta$Sex
+  )
+
+  p <- ggplot(ord_df, aes(Axis1, Axis2, color = SampleType, shape = Sex)) +
+    geom_point(size = 3, alpha = 0.9) +
+    stat_ellipse(
+      aes(group = SampleType, color = SampleType),
+      type = "t",
+      linewidth = 1,
+      show.legend = FALSE
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+
+    annotate(
+  "label",
+  x = 0.65,
+  y = -0.45,
+  label = label_text,
+  hjust = 1,
+  vjust = 0,
+  size = 3.8,
+  fill = "white",
+  alpha = 0.9
+) +
+
+    scale_color_manual(values = c(
+  "CON"    = "#1f78b4",
+  "ALC"    = "#e31a1c",
+  "CB"     = "#33a02c",
+  "ALC+CB" = "#6a3d9a"
+)) +
+
+    labs(
+      x = paste0("PCoA1 (", var_exp[1], "%)"),
+      y = paste0("PCoA2 (", var_exp[2], "%)"),
+      color = "Treatment",
+      shape = "Sex"
+    ) +
+
+    ggtitle(paste(group1, "vs", group2)) +
+
+    coord_cartesian(clip = "off") +
+
+    theme_bw(base_size = 12) +
+
+    theme(
+      panel.grid = element_blank(),
+      plot.title = element_text(
+        hjust = 0.5,
+        margin = margin(b = 15)
+      ),
+      plot.margin = margin(10, 10, 35, 10)
+    )
+
+  return(list(
+    plot = p,
+    R2 = R2_val,
+    pvalue = p_val
+  ))
+}
+
+# Run pairwise comparisons
+ps_beta <- ps_filtered
+
+# Set seed for reproducible permutation tests
+set.seed(123)
+c1 <- pairwise_pcoa_plot(ps_beta, "CON", "ALC")
+c2 <- pairwise_pcoa_plot(ps_beta, "CON", "CB")
+c3 <- pairwise_pcoa_plot(ps_beta, "CON", "ALC+CB")
+c4 <- pairwise_pcoa_plot(ps_beta, "CB", "ALC+CB")
+c5 <- pairwise_pcoa_plot(ps_beta, "ALC", "CB")
+c6 <- pairwise_pcoa_plot(ps_beta, "ALC", "ALC+CB")
+
+# Create PERMANOVA table
+perm_table <- data.frame(
+  Comparison = c(
+    "CON vs ALC",
+    "CON vs CB",
+    "CON vs ALC+CB",
+    "CB vs ALC+CB",
+    "ALC vs CB",
+    "ALC vs ALC+CB"
+  ),
+  R2 = c(c1$R2, c2$R2, c3$R2, c4$R2, c5$R2, c6$R2),
+  pvalue = c(c1$pvalue, c2$pvalue, c3$pvalue, c4$pvalue, c5$pvalue, c6$pvalue)
+)
+
+# Benjamini-Hochberg correction
+perm_table$qvalue <- p.adjust(perm_table$pvalue, method = "BH")
+
+# Replot using q-values
+set.seed(123)
+c1 <- pairwise_pcoa_plot(ps_beta, "CON", "ALC", perm_table$qvalue[1])
+c2 <- pairwise_pcoa_plot(ps_beta, "CON", "CB", perm_table$qvalue[2])
+c3 <- pairwise_pcoa_plot(ps_beta, "CON", "ALC+CB", perm_table$qvalue[3])
+c4 <- pairwise_pcoa_plot(ps_beta, "CB", "ALC+CB", perm_table$qvalue[4])
+c5 <- pairwise_pcoa_plot(ps_beta, "ALC", "CB", perm_table$qvalue[5])
+c6 <- pairwise_pcoa_plot(ps_beta, "ALC", "ALC+CB", perm_table$qvalue[6])
+
+# Combine panels
+p_panel <- (c1$plot | c2$plot | c3$plot) /
+           (c4$plot| c5$plot | c6$plot)
+
+p_panel
+
+# Save figure
+ggsave(
+  file.path(alpha_beta_dir, "Pairwise_PCoA_panels_with_qvalues.pdf"),
+  plot = p_panel,
+  width = 16,
+  height = 10
+)
+
+# Save table
+write.csv(
+  perm_table,
+  file.path(alpha_beta_dir, "Pairwise_PERMANOVA_results.csv"),
+  row.names = FALSE
+)
+
+perm_table
+```
+
+# Export relative-abundance tables for visualization and downstream summaries
+# Counts are converted to relative abundance (0–1) after removal of MICE.SEQ13.
+# No additional prevalence or abundance filtering is applied here.
+```{r}
+# Do NOT apply any prevalence filtering
+#    We will use ps_filtered (remove outlier no13) exactly as is.
+
+# ==============================
+# Create output folder
+# ==============================
+output_dir <- "Microbiome_RelAbundance_Output"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+# Convert counts → relative abundance (0–1)###TSS conversion
+ps_rel <- transform_sample_counts(ps_filtered, function(x) x / sum(x)) ### remove the outlier sample no. 13
+
+
+# Extract metadata
+meta_df <- as.data.frame(sample_data(ps_rel))
+meta_df$SampleID <- rownames(meta_df)
+
+# Create Excel workbook
+wb <- createWorkbook()
+
+tax_ranks <- c("Kingdom","Phylum","Class","Order","Family","Genus","Species")
+
+for (rank in tax_ranks) {
+
+  if (!(rank %in% colnames(tax_table(ps_rel)))) next
+
+  # Aggregate at taxonomic rank
+  ps_rank <- tax_glom(ps_rel, taxrank = rank)
+
+  mat <- as.data.frame(otu_table(ps_rank))
+  if (!taxa_are_rows(ps_rank)) mat <- t(mat)
+
+  tax_df <- as.data.frame(tax_table(ps_rank))
+
+  # Replace NA/blank with "Unclassified"
+  tax_names <- as.character(tax_df[[rank]])
+  tax_names[is.na(tax_names) | tax_names == ""] <- "Unclassified"
+
+  # Make unique names
+  tax_names <- make.unique(tax_names)
+
+  # Samples as rows
+  mat2 <- as.data.frame(t(mat))
+  colnames(mat2) <- tax_names
+  mat2$SampleID <- rownames(mat2)
+
+  # Join metadata
+  final_df <- left_join(mat2, meta_df, by = "SampleID") %>%
+    arrange(SampleType, Sex) %>%
+    select(SampleID, SampleType, Sex, everything())
+
+  addWorksheet(wb, rank)
+  writeData(wb, rank, final_df)
+}
+
+saveWorkbook(
+  wb,
+  file.path(output_dir,"Relative_Abundance_All_Taxonomic_Levels_with_Metadata_nofilters_nosample13.xlsx"),
+  overwrite = TRUE
+)
+
+cat("Export completed successfully (relative abundance 0–1, no filtering).\n")
+
+```
+
+```{r}
+# Record R and package versions
+sessionInfo()
+```
+
+
+
+
