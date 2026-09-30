@@ -1,0 +1,1332 @@
+---
+title: "Spearman_correlation_microbiota_behavior"
+author: "Deepa Upreti"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#---------------------------------------------------------#
+1. Microbiota_Behavior_correlation_Faceted_Volcano_By_Level
+#---------------------------------------------------------#
+```{r}
+
+library(tidyverse)
+library(readxl)
+library(ggpubr)
+library(ggrepel)
+library(scales)
+
+# ==============================
+# Output folder
+# ==============================
+
+outdir <- "Microbiota_Behavior_Faceted_Volcano_By_Level"
+dir.create(outdir, showWarnings = FALSE)
+
+# ==============================
+# Load data
+# ==============================
+
+df <- read_excel("Spearman correlation_microbiota_behaviour.xlsx")
+
+
+# ==============================
+# Rename exposure groups
+# ==============================
+
+df <- df %>%
+  mutate(
+    SampleType = recode(
+      as.character(SampleType),
+      "Control" = "CON",
+      "PAE"     = "ALC",
+      "CBD"     = "CB",
+      "SAC"     = "ALC+CB"
+    ),
+    SampleType = factor(
+      SampleType,
+      levels = c("CON", "ALC", "CB", "ALC+CB")
+    )
+  )
+
+# Verify group labels and sample numbers
+table(df$SampleType, useNA = "ifany")
+
+
+# ==============================
+# Behaviors
+# ==============================
+
+behaviors <- c(
+  "Time on rotarod",
+  "Time in center_Open field",
+  "Distance_travelled"
+)
+
+behavior_titles <- c(
+  "Time on rotarod" = "Time on rotarod",
+  "Time in center_Open field" = "Time in center_Open field",
+  "Distance_travelled" = "Distance travelled"
+)
+
+# ==============================
+# Taxonomic levels
+# ==============================
+
+tax_levels <- list(
+  Phylum  = "^p__",
+  Family  = "^f__",
+  Genus   = "^g__",
+  Species = "^s__"
+)
+
+prevalence_cutoff <- 0.40
+
+# ==============================
+# Function to run correlations
+# ==============================
+
+run_level_correlation <- function(df, level_name, taxa_pattern){
+
+  taxa <- grep(taxa_pattern, colnames(df), value = TRUE)
+
+  if(length(taxa) == 0){
+    return(NULL)
+  }
+
+  df_level <- df %>%
+    mutate(across(
+      all_of(c(taxa, behaviors)),
+      ~ suppressWarnings(as.numeric(as.character(.)))
+    ))
+
+  present_fraction <- colMeans(df_level[taxa] > 0, na.rm = TRUE)
+
+  taxa_filtered <- names(
+    present_fraction[present_fraction >= prevalence_cutoff]
+  )
+
+  if(length(taxa_filtered) == 0){
+    return(NULL)
+  }
+
+  corr_results <- data.frame()
+
+  for(t in taxa_filtered){
+
+    for(b in behaviors){
+
+      temp_df <- df_level %>%
+        mutate(
+          Taxa_value = .data[[t]],
+          Behavior_value = .data[[b]]
+        ) %>%
+        filter(
+          !is.na(Taxa_value),
+          !is.na(Behavior_value)
+        )
+
+      if(
+        nrow(temp_df) >= 4 &&
+        length(unique(temp_df$Taxa_value)) > 1 &&
+        length(unique(temp_df$Behavior_value)) > 1
+      ){
+
+        test <- suppressWarnings(
+          cor.test(
+            temp_df$Taxa_value,
+            temp_df$Behavior_value,
+            method = "spearman",
+            exact = FALSE
+          )
+        )
+
+        corr_results <- rbind(
+          corr_results,
+          data.frame(
+            Level = level_name,
+            Taxa = t,
+            Behavior = b,
+            Rho = unname(test$estimate),
+            Pvalue = test$p.value,
+            N = nrow(temp_df)
+          )
+        )
+      }
+    }
+  }
+
+  if(nrow(corr_results) == 0){
+    return(NULL)
+  }
+
+  corr_results <- corr_results %>%
+  group_by(Behavior) %>%
+  mutate(
+    FDR = p.adjust(Pvalue, method = "BH"),
+    neglog10P = -log10(Pvalue),
+    Abs_Rho = abs(Rho),
+
+    Sig_Category = case_when(
+      Pvalue < 0.05 & Rho > 0 ~ "Positive significant",
+      Pvalue < 0.05 & Rho < 0 ~ "Negative significant",
+      TRUE ~ "Other"
+    ),
+
+    Taxa_clean = Taxa %>%
+      str_replace("^[pfgs]__", "") %>%
+      str_replace_all("_", " ") %>%
+      str_replace_all("'", ""),
+
+    Behavior_clean = as.character(behavior_titles[Behavior]),
+
+    Plot_Label = case_when(
+      Level %in% c("Genus", "Species") ~
+        paste0("italic('", Taxa_clean, "')"),
+
+      TRUE ~
+        paste0("'", Taxa_clean, "'")
+    )
+  ) %>%
+  ungroup() %>%
+  arrange(Pvalue)
+
+  return(corr_results)
+}
+
+# ==============================
+# Run all levels
+# ==============================
+
+all_results <- list()
+
+for(level_name in names(tax_levels)){
+
+  message("Running: ", level_name)
+
+  res <- run_level_correlation(
+    df = df,
+    level_name = level_name,
+    taxa_pattern = tax_levels[[level_name]]
+  )
+
+  if(!is.null(res)){
+    all_results[[level_name]] <- res
+  }
+}
+
+all_results_df <- bind_rows(all_results)
+
+if(nrow(all_results_df) == 0){
+  stop("No correlation results were generated. Check input columns or prevalence cutoff.")
+}
+
+write.csv(
+  all_results_df,
+  file.path(outdir, "All_Levels_Spearman_Correlation_Results.csv"),
+  row.names = FALSE
+)
+
+# ==============================
+# Fixed axes
+# ==============================
+
+x_limits <- c(
+  floor(min(all_results_df$Rho[is.finite(all_results_df$Rho)], na.rm = TRUE) * 10) / 10,
+  ceiling(max(all_results_df$Rho[is.finite(all_results_df$Rho)], na.rm = TRUE) * 10) / 10
+)
+
+y_limits <- c(0, 5)
+y_breaks <- c(0, 1, 2, 3, 4, 5)
+
+# ==============================
+# Faceted volcano for each taxonomic level
+# ==============================
+
+for(level_name in unique(all_results_df$Level)){
+
+  plot_df <- all_results_df %>%
+    filter(Level == level_name)
+
+  label_df <- plot_df %>%
+    filter(Pvalue < 0.05)
+
+  p <- ggplot(
+    plot_df,
+    aes(
+      x = Rho,
+      y = neglog10P
+    )
+  ) +
+    annotate(
+      "rect",
+      xmin = -Inf,
+      xmax = Inf,
+      ymin = -log10(0.05),
+      ymax = Inf,
+      fill = "#FDE0DD",
+      alpha = 0.45
+    ) +
+    geom_point(
+      aes(
+        color = Sig_Category,
+        size = Abs_Rho
+      ),
+      alpha = 0.90
+    ) +
+    geom_vline(
+      xintercept = 0,
+      color = "black",
+      linewidth = 0.7
+    ) +
+    geom_hline(
+      yintercept = -log10(0.05),
+      linetype = "dashed",
+      color = "black",
+      linewidth = 0.7
+    ) +
+    geom_text_repel(
+      data = label_df,
+      aes(label = Plot_Label),
+      parse = TRUE,
+      size = 5.2,
+      fontface = "plain",
+      max.overlaps = 10,
+      box.padding = 0.7,
+      point.padding = 0.4,
+      segment.color = "grey40",
+      segment.size = 0.4,
+      min.segment.length = 0,
+      na.rm = TRUE
+    ) +
+    facet_wrap(
+      ~ Behavior_clean,
+      nrow = 1
+    ) +
+    coord_cartesian(
+      xlim = x_limits,
+      ylim = y_limits
+    ) +
+    scale_y_continuous(
+      breaks = y_breaks
+    ) +
+    scale_color_manual(
+      values = c(
+        "Positive significant" = "#D73027",
+        "Negative significant" = "#4575B4",
+        "Other" = "grey70"
+      )
+    ) +
+    scale_size_continuous(
+      range = c(2.5, 7)
+    ) +
+    theme_classic(base_size = 18) +
+    theme(
+      strip.background = element_rect(
+        fill = "grey95",
+        color = "black",
+        linewidth = 0.8
+      ),
+      strip.text = element_text(
+        face = "bold",
+        size = 20,
+        color = "black"
+      ),
+      axis.title = element_text(
+        face = "bold",
+        size = 28
+      ),
+      axis.text = element_text(
+        color = "black",
+        size = 20
+      ),
+      axis.line = element_line(
+        linewidth = 0.9,
+        color = "black"
+      ),
+      axis.ticks = element_line(
+        linewidth = 0.8,
+        color = "black"
+      ),
+      legend.title = element_text(
+        face = "bold",
+        size = 20
+      ),
+      legend.text = element_text(
+        size = 18
+      ),
+      plot.title = element_text(
+        face = "bold",
+        size = 28,
+        hjust = 0.5
+      ),
+      plot.subtitle = element_text(
+        size = 16,
+        hjust = 0.5
+      ),
+      panel.spacing = unit(2.0, "lines"),
+      plot.margin = margin(15, 15, 15, 15)
+    ) +
+    guides(
+      size = guide_legend(order = 2),
+      color = guide_legend(
+        order = 1,
+        override.aes = list(size = 5)
+      )
+    ) +
+    labs(
+      title = paste0(level_name, "-level microbiota–behavior correlations"),
+      subtitle = "Spearman correlations using microbial relative abundance",
+      x = "Spearman rho",
+      y = expression(-log[10](italic(p))),
+      color = "Association",
+      size = expression("|" * rho * "|")
+    )
+
+  print(p)
+
+  ggsave(
+    file.path(
+      outdir,
+      paste0(level_name, "_Faceted_Behavior_Spearman_Volcano.pdf")
+    ),
+    p,
+    width = 16,
+    height = 8
+  )
+}
+```
+
+##ADDITIONAL GENUS LEVEL SCATTERPLOTS
+```{r genus-significant-scatterplots-log10scale-clean, message=FALSE, warning=FALSE}
+
+genus_scatter_dir <- file.path(outdir, "Genus_Significant_Scatterplots_Log10Scale")
+dir.create(genus_scatter_dir, showWarnings = FALSE)
+
+genus_sig <- all_results_df %>%
+  filter(Level == "Genus", Pvalue < 0.05) %>%
+  arrange(Pvalue)
+
+write.csv(
+  genus_sig,
+  file.path(genus_scatter_dir, "Genus_Significant_Hits_For_Scatterplots.csv"),
+  row.names = FALSE
+)
+
+if(nrow(genus_sig) == 0){
+  stop("No significant genus-level hits found.")
+}
+
+pseudocount <- 1e-6
+
+group_colors <- c(
+  "CON" = "#7CAE00",
+  "ALC" = "#00BFC4",
+  "CB" = "#F8766D",
+  "ALC+CB" = "#C77CFF"
+)
+
+make_genus_scatter <- function(data, taxa_name, behavior_name){
+
+  taxa_clean <- taxa_name %>%
+    str_replace("^g__", "") %>%
+    str_replace_all("_", " ")
+
+  behavior_clean <- behavior_titles[[behavior_name]]
+  if(is.null(behavior_clean)){
+    behavior_clean <- behavior_name
+  }
+
+  plot_df <- data %>%
+    mutate(
+      Taxa_value = suppressWarnings(
+        as.numeric(as.character(.data[[taxa_name]]))
+      ) + pseudocount,
+
+      Behavior_value = suppressWarnings(
+        as.numeric(as.character(.data[[behavior_name]]))
+      ),
+
+      SampleType = factor(
+  SampleType,
+  levels = c("CON", "ALC", "CB", "ALC+CB")
+)
+    ) %>%
+    filter(
+      !is.na(Taxa_value),
+      !is.na(Behavior_value),
+      Taxa_value > 0,
+      !is.na(SampleType)
+    )
+
+  overall_cor <- suppressWarnings(
+    cor.test(
+      plot_df$Taxa_value,
+      plot_df$Behavior_value,
+      method = "spearman",
+      exact = FALSE
+    )
+  )
+
+  group_stats <- plot_df %>%
+    group_by(SampleType) %>%
+    summarise(
+      n = n(),
+      rho = ifelse(
+        n >= 4 &&
+          length(unique(Taxa_value)) > 1 &&
+          length(unique(Behavior_value)) > 1,
+        suppressWarnings(cor.test(
+          Taxa_value,
+          Behavior_value,
+          method = "spearman",
+          exact = FALSE
+        )$estimate),
+        NA
+      ),
+      p = ifelse(
+        n >= 4 &&
+          length(unique(Taxa_value)) > 1 &&
+          length(unique(Behavior_value)) > 1,
+        suppressWarnings(cor.test(
+          Taxa_value,
+          Behavior_value,
+          method = "spearman",
+          exact = FALSE
+        )$p.value),
+        NA
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      rho = round(rho, 2),
+      p_text = case_when(
+        is.na(p) ~ "NA",
+        p < 0.001 ~ "<0.001",
+        TRUE ~ as.character(signif(p, 2))
+      ),
+      label_text = paste0(SampleType, ": rho=", rho, ", p=", p_text)
+    )
+
+  overall_p_text <- case_when(
+    overall_cor$p.value < 0.001 ~ "<0.001",
+    TRUE ~ as.character(signif(overall_cor$p.value, 2))
+  )
+
+  subtitle_text <- paste0(
+    "Overall: rho=",
+    round(unname(overall_cor$estimate), 2),
+    ", p=",
+    overall_p_text
+  )
+
+  caption_text <- paste(group_stats$label_text, collapse = "   |   ")
+
+  p <- ggplot(plot_df, aes(x = Taxa_value, y = Behavior_value)) +
+    geom_point(
+      aes(color = SampleType),
+      size = 4,
+      alpha = 0.85
+    ) +
+    geom_smooth(
+      method = "lm",
+      color = "black",
+      fill = "grey80",
+      se = TRUE,
+      linewidth = 1.1
+    ) +
+    geom_smooth(
+      aes(color = SampleType),
+      method = "lm",
+      se = FALSE,
+      linewidth = 0.9,
+      linetype = "dotted"
+    ) +
+    scale_x_log10(
+      labels = label_scientific(),
+      expand = expansion(mult = c(0.05, 0.10))
+    ) +
+    scale_color_manual(values = group_colors) +
+    theme_classic(base_size = 20) +
+    theme(
+      axis.title = element_text(face = "bold", size = 24),
+      axis.text = element_text(color = "black", size = 20),
+      axis.line = element_line(linewidth = 0.9, color = "black"),
+      axis.ticks = element_line(linewidth = 0.8, color = "black"),
+      legend.title = element_blank(),
+      legend.text = element_text(size = 18),
+      plot.title = element_text(face = "plain", size = 24, hjust = 0.5),
+      plot.subtitle = element_text(size = 18, hjust = 0.5),
+      plot.caption = element_text(size = 16, hjust = 0, face = "bold", color = "black"),
+      plot.margin = margin(t = 15, r = 15, b = 35, l = 35)
+    ) +
+    labs(
+      subtitle = subtitle_text,
+      caption = caption_text,
+      x = bquote(
+        atop(italic(.(taxa_clean)), "relative abundance (log10 scale)")
+      ),
+      y = behavior_clean
+    ) +
+    ggtitle(
+      bquote(italic(.(taxa_clean)) ~ "vs" ~ .(as.character(behavior_clean)))
+    )
+
+  return(p)
+}
+
+genus_plots <- list()
+
+for(i in seq_len(nrow(genus_sig))){
+
+  taxa_i <- genus_sig$Taxa[i]
+  behavior_i <- genus_sig$Behavior[i]
+
+  p_i <- make_genus_scatter(df, taxa_i, behavior_i)
+
+  genus_plots[[i]] <- p_i
+  print(p_i)
+
+  safe_taxa <- taxa_i %>%
+    str_replace("^g__", "") %>%
+    str_replace_all("[^A-Za-z0-9_]", "_")
+
+  safe_behavior <- behavior_titles[[behavior_i]]
+  if(is.null(safe_behavior)){
+    safe_behavior <- behavior_i
+  }
+
+  safe_behavior <- safe_behavior %>%
+    str_replace_all(" ", "_") %>%
+    str_replace_all("[^A-Za-z0-9_]", "")
+
+  ggsave(
+    file.path(genus_scatter_dir, paste0("Scatter_", safe_taxa, "_", safe_behavior, ".pdf")),
+    p_i,
+    width = 14,
+    height = 8
+  )
+}
+
+if(length(genus_plots) > 0){
+
+  combined_genus <- ggarrange(
+    plotlist = genus_plots,
+    ncol = 2,
+    nrow = ceiling(length(genus_plots) / 2),
+    common.legend = TRUE,
+    legend = "right"
+  )
+
+  ggsave(
+    file.path(genus_scatter_dir, "Combined_Genus_Significant_Scatterplots.pdf"),
+    combined_genus,
+    width = 28,
+    height = ceiling(length(genus_plots) / 2) * 10
+  )
+}
+
+```
+
+#ADDITIONAL SPECIES_LEVEL SCATTERPLOTS
+```{r species-significant-scatterplots-log10scale-clean, message=FALSE, warning=FALSE}
+
+species_scatter_dir <- file.path(outdir, "Species_Significant_Scatterplots_Log10Scale")
+dir.create(species_scatter_dir, showWarnings = FALSE)
+
+species_sig <- all_results_df %>%
+  filter(Level == "Species", Pvalue < 0.05) %>%
+  arrange(Pvalue)
+
+write.csv(
+  species_sig,
+  file.path(species_scatter_dir, "Species_Significant_Hits_For_Scatterplots.csv"),
+  row.names = FALSE
+)
+
+if(nrow(species_sig) == 0){
+  stop("No significant species-level hits found.")
+}
+
+pseudocount <- 1e-6
+
+group_colors <- c(
+  "CON" = "#7CAE00",
+  "ALC" = "#00BFC4",
+  "CB" = "#F8766D",
+  "ALC+CB" = "#C77CFF"
+)
+
+make_species_scatter <- function(data, taxa_name, behavior_name){
+
+  taxa_clean <- taxa_name %>%
+    str_replace("^s__", "") %>%
+    str_replace_all("_", " ")
+
+  behavior_clean <- behavior_titles[[behavior_name]]
+  if(is.null(behavior_clean)){
+    behavior_clean <- behavior_name
+  }
+
+  plot_df <- data %>%
+    mutate(
+      Taxa_value = suppressWarnings(
+        as.numeric(as.character(.data[[taxa_name]]))
+      ) + pseudocount,
+
+      Behavior_value = suppressWarnings(
+        as.numeric(as.character(.data[[behavior_name]]))
+      ),
+
+      SampleType = factor(
+  SampleType,
+  levels = c("CON", "ALC", "CB", "ALC+CB")
+)
+    ) %>%
+    filter(
+      !is.na(Taxa_value),
+      !is.na(Behavior_value),
+      Taxa_value > 0,
+      !is.na(SampleType)
+    )
+
+  overall_cor <- suppressWarnings(
+    cor.test(
+      plot_df$Taxa_value,
+      plot_df$Behavior_value,
+      method = "spearman",
+      exact = FALSE
+    )
+  )
+
+  group_stats <- plot_df %>%
+    group_by(SampleType) %>%
+    summarise(
+      n = n(),
+      rho = ifelse(
+        n >= 4 &&
+          length(unique(Taxa_value)) > 1 &&
+          length(unique(Behavior_value)) > 1,
+        suppressWarnings(cor.test(
+          Taxa_value,
+          Behavior_value,
+          method = "spearman",
+          exact = FALSE
+        )$estimate),
+        NA
+      ),
+      p = ifelse(
+        n >= 4 &&
+          length(unique(Taxa_value)) > 1 &&
+          length(unique(Behavior_value)) > 1,
+        suppressWarnings(cor.test(
+          Taxa_value,
+          Behavior_value,
+          method = "spearman",
+          exact = FALSE
+        )$p.value),
+        NA
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      rho = round(rho, 2),
+      p_text = case_when(
+        is.na(p) ~ "NA",
+        p < 0.001 ~ "<0.001",
+        TRUE ~ as.character(signif(p, 2))
+      ),
+      label_text = paste0(SampleType, ": rho=", rho, ", p=", p_text)
+    )
+
+  overall_p_text <- case_when(
+    overall_cor$p.value < 0.001 ~ "<0.001",
+    TRUE ~ as.character(signif(overall_cor$p.value, 2))
+  )
+
+  subtitle_text <- paste0(
+    "Overall: rho=",
+    round(unname(overall_cor$estimate), 2),
+    ", p=",
+    overall_p_text
+  )
+
+  # Line breaks prevent clipping in combined panels
+  caption_text <- paste(group_stats$label_text, collapse = "   |   ")
+  
+  p <- ggplot(plot_df, aes(x = Taxa_value, y = Behavior_value)) +
+    geom_point(
+      aes(color = SampleType),
+      size = 4,
+      alpha = 0.85
+    ) +
+    geom_smooth(
+      method = "lm",
+      color = "black",
+      fill = "grey80",
+      se = TRUE,
+      linewidth = 1.1
+    ) +
+    geom_smooth(
+      aes(color = SampleType),
+      method = "lm",
+      se = FALSE,
+      linewidth = 0.9,
+      linetype = "dotted"
+    ) +
+    scale_x_log10(
+      labels = label_scientific(),
+      expand = expansion(mult = c(0.05, 0.10))
+    ) +
+    scale_color_manual(values = group_colors) +
+    theme_classic(base_size = 20) +
+    theme(
+      axis.title = element_text(face = "bold", size = 24),
+      axis.text = element_text(color = "black", size = 20),
+      axis.line = element_line(linewidth = 0.9, color = "black"),
+      axis.ticks = element_line(linewidth = 0.8, color = "black"),
+      legend.title = element_blank(),
+      legend.text = element_text(size = 18),
+      plot.title = element_text(face = "plain", size = 24, hjust = 0.5),
+      plot.subtitle = element_text(size = 18, hjust = 0.5),
+      plot.caption = element_text(size = 16, hjust = 0, face = "bold", color = "black"),
+      plot.margin = margin(t = 15, r = 15, b = 35, l = 35)
+    ) +
+  labs(
+      subtitle = subtitle_text,
+      caption = caption_text,
+      # FIX: Used atop() to handle multi-line math expression wrapping
+      x = bquote(
+        atop(italic(.(taxa_clean)), "relative abundance (log10 scale)")
+      ),
+      y = behavior_clean
+    ) +
+    # FIX: Cleaned up bquote syntax to evaluate character string correctly
+    ggtitle(
+      bquote(italic(.(taxa_clean)) ~ "vs" ~ .(as.character(behavior_clean)))
+    )
+
+  return(p)
+}
+
+species_plots <- list()
+
+for(i in seq_len(nrow(species_sig))){
+
+  taxa_i <- species_sig$Taxa[i]
+  behavior_i <- species_sig$Behavior[i]
+
+  p_i <- make_species_scatter(df, taxa_i, behavior_i)
+
+  species_plots[[i]] <- p_i
+  print(p_i)
+
+  safe_taxa <- taxa_i %>%
+    str_replace("^s__", "") %>%
+    str_replace_all("[^A-Za-z0-9_]", "_")
+
+  safe_behavior <- behavior_titles[[behavior_i]] %>%
+    str_replace_all(" ", "_") %>%
+    str_replace_all("[^A-Za-z0-9_]", "")
+
+  ggsave(
+    file.path(species_scatter_dir, paste0("Scatter_", safe_taxa, "_", safe_behavior, ".pdf")),
+    p_i,
+    width = 14,
+    height = 8
+  )
+}
+
+if(length(species_plots) > 0){
+
+  combined_species <- ggarrange(
+    plotlist = species_plots,
+    ncol = 2,
+    nrow = ceiling(length(species_plots) / 2),
+    common.legend = TRUE,
+    legend = "right"
+  )
+
+  ggsave(
+    file.path(species_scatter_dir, "Combined_Species_Significant_Scatterplots.pdf"),
+    combined_species,
+    width = 28,
+    height = ceiling(length(species_plots) / 2) * 10
+  )
+}
+
+```
+#Spearman correlation between Control and Prenatal Exposure (ALC, CB, ALC+CB)
+
+```{r}
+
+# ==============================
+# Output folder
+# ==============================
+
+exposure_scatter_dir <- file.path(
+  outdir,
+  "Genus_Species_CON_vs_PrenatalExposure_Scatterplots"
+)
+
+dir.create(exposure_scatter_dir, showWarnings = FALSE)
+
+# ==============================
+# Use significant genus + species hits
+# from previous volcano result table
+# ==============================
+
+sig_genus_species <- all_results_df %>%
+  filter(
+    Level %in% c("Genus", "Species"),
+    Pvalue < 0.05
+  ) %>%
+  arrange(Level, Pvalue)
+
+write.csv(
+  sig_genus_species,
+  file.path(
+    exposure_scatter_dir,
+    "Significant_Genus_Species_Hits_For_CON_vs_Exposure.csv"
+  ),
+  row.names = FALSE
+)
+
+if(nrow(sig_genus_species) == 0){
+  stop("No significant genus/species hits found at Pvalue < 0.05.")
+}
+
+# ==============================
+# Settings
+# ==============================
+
+pseudocount <- 1e-6
+
+group_colors <- c(
+  "CON" = "#377EB8",
+  "Prenatal Exposure" = "#E41A1C"
+)
+
+# ==============================
+# Scatterplot function
+# ==============================
+
+make_exposure_scatter <- function(data, taxa_name, behavior_name, level_name){
+
+  taxa_clean <- taxa_name %>%
+    str_replace("^(g__|s__)", "") %>%
+    str_replace_all("_", " ")
+
+  # Safety check for behavior titles lookup
+  behavior_clean <- behavior_titles[[behavior_name]]
+  if (is.null(behavior_clean)) {
+    behavior_clean <- behavior_name
+  }
+
+  plot_df <- data %>%
+    mutate(
+      Taxa_value = suppressWarnings(
+        as.numeric(as.character(.data[[taxa_name]]))
+      ) + pseudocount,
+
+      Behavior_value = suppressWarnings(
+        as.numeric(as.character(.data[[behavior_name]]))
+      ),
+
+      ExposureGroup = case_when(
+  SampleType == "CON" ~ "CON",
+  SampleType %in% c("ALC", "CB", "ALC+CB") ~ "Prenatal Exposure",
+  TRUE ~ NA_character_
+),
+
+ExposureGroup = factor(
+  ExposureGroup,
+  levels = c("CON", "Prenatal Exposure")
+)
+    ) %>%
+    filter(
+      !is.na(Taxa_value),
+      !is.na(Behavior_value),
+      Taxa_value > 0,
+      !is.na(ExposureGroup)
+    )
+
+  overall_cor <- suppressWarnings(
+    cor.test(
+      plot_df$Taxa_value,
+      plot_df$Behavior_value,
+      method = "spearman",
+      exact = FALSE
+    )
+  )
+
+  group_stats <- plot_df %>%
+    group_by(ExposureGroup) %>%
+    summarise(
+      n = n(),
+      rho = ifelse(
+        n >= 4 &&
+          length(unique(Taxa_value)) > 1 &&
+          length(unique(Behavior_value)) > 1,
+        suppressWarnings(
+          cor.test(
+            Taxa_value,
+            Behavior_value,
+            method = "spearman",
+            exact = FALSE
+          )$estimate
+        ),
+        NA
+      ),
+      p = ifelse(
+        n >= 4 &&
+          length(unique(Taxa_value)) > 1 &&
+          length(unique(Behavior_value)) > 1,
+        suppressWarnings(
+          cor.test(
+            Taxa_value,
+            Behavior_value,
+            method = "spearman",
+            exact = FALSE
+          )$p.value
+        ),
+        NA
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      rho = round(rho, 2),
+      p_text = case_when(
+        is.na(p) ~ "NA",
+        p < 0.001 ~ "<0.001",
+        TRUE ~ as.character(signif(p, 2))
+      ),
+      label_text = paste0(
+        ExposureGroup,
+        ": rho=",
+        rho,
+        ", p=",
+        p_text
+      )
+    )
+
+  overall_p_text <- case_when(
+    overall_cor$p.value < 0.001 ~ "<0.001",
+    TRUE ~ as.character(signif(overall_cor$p.value, 2))
+  )
+
+  subtitle_text <- paste0(
+    "Overall: rho=",
+    round(unname(overall_cor$estimate), 2),
+    ", p=",
+    overall_p_text
+  )
+
+  caption_text <- paste(group_stats$label_text, collapse = "   |   ")
+
+  p <- ggplot(
+    plot_df,
+    aes(
+      x = Taxa_value,
+      y = Behavior_value
+    )
+  ) +
+    geom_point(
+      aes(color = ExposureGroup),
+      size = 4.2,
+      alpha = 0.85
+    ) +
+    geom_smooth(
+      method = "lm",
+      color = "black",
+      fill = "grey80",
+      se = TRUE,
+      linewidth = 1.1
+    ) +
+    geom_smooth(
+      aes(color = ExposureGroup),
+      method = "lm",
+      se = FALSE,
+      linewidth = 0.9,
+      linetype = "dotted"
+    ) +
+    scale_x_log10(
+      labels = label_scientific(),
+      expand = expansion(mult = c(0.05, 0.10))
+    ) +
+    scale_color_manual(values = group_colors) +
+    theme_classic(base_size = 20) +
+    theme(
+      axis.title = element_text(face = "bold", size = 24),
+      axis.text = element_text(color = "black", size = 20),
+      axis.line = element_line(linewidth = 0.9, color = "black"),
+      axis.ticks = element_line(linewidth = 0.8, color = "black"),
+      legend.title = element_blank(),
+      legend.text = element_text(size = 18),
+      plot.title = element_text(face = "plain", size = 24, hjust = 0.5),
+      plot.subtitle = element_text(size = 18, hjust = 0.5),
+      plot.caption = element_text(
+        size = 16,
+        hjust = 0,
+        face = "bold",
+        color = "black"
+      ),
+      plot.margin = margin(t = 15, r = 15, b = 25, l = 15)
+    ) +
+    labs(
+      subtitle = subtitle_text,
+      caption = caption_text,
+      # FIX: Used atop() to handle multi-line math expression wrapping
+      x = bquote(
+        atop(italic(.(taxa_clean)), "relative abundance (log10 scale)")
+      ),
+      y = behavior_clean
+    ) +
+    # FIX: Cleaned up bquote syntax to evaluate character string correctly
+    ggtitle(
+      bquote(italic(.(taxa_clean)) ~ "vs" ~ .(as.character(behavior_clean)))
+    )
+
+  return(p)
+}
+
+# ==============================
+# Generate plots
+# ==============================
+
+exposure_plots <- list()
+
+for(i in seq_len(nrow(sig_genus_species))){
+
+  taxa_i <- sig_genus_species$Taxa[i]
+  behavior_i <- sig_genus_species$Behavior[i]
+  level_i <- sig_genus_species$Level[i]
+
+  p_i <- make_exposure_scatter(
+    data = df,
+    taxa_name = taxa_i,
+    behavior_name = behavior_i,
+    level_name = level_i
+  )
+
+  exposure_plots[[i]] <- p_i
+
+  print(p_i)
+
+  safe_taxa <- taxa_i %>%
+    str_replace("^(g__|s__)", "") %>%
+    str_replace_all("[^A-Za-z0-9_]", "_")
+
+  # Safety check fallback for ggsave naming
+  b_title <- behavior_titles[[behavior_i]]
+  if (is.null(b_title)) b_title <- behavior_i
+
+  safe_behavior <- b_title %>%
+    str_replace_all(" ", "_") %>%
+    str_replace_all("[^A-Za-z0-9_]", "")
+
+  safe_level <- level_i
+
+  ggsave(
+    file.path(
+      exposure_scatter_dir,
+      paste0(
+        safe_level,
+        "_Scatter_",
+        safe_taxa,
+        "_",
+        safe_behavior,
+        "_CON_vs_PrenatalExposure.pdf"
+      )
+    ),
+    p_i,
+    width = 10,
+    height = 7
+  )
+}
+
+# ==============================
+# Combined panel
+# ==============================
+
+if(length(exposure_plots) > 0){
+
+  # FIX: Explicitly remove legends on elements before using common.legend
+  plots_for_panel <- lapply(exposure_plots, function(p) {
+    p + theme(legend.position = "none")
+  })
+
+  combined_exposure <- ggarrange(
+    plotlist = plots_for_panel,
+    ncol = 3,
+    nrow = ceiling(length(plots_for_panel) / 3),
+    common.legend = TRUE,
+    legend = "right",
+    legend.grob = get_legend(exposure_plots[[1]]) # Pulls crisp unified legend
+  )
+
+  ggsave(
+    file.path(
+      exposure_scatter_dir,
+      "Combined_Genus_Species_CON_vs_PrenatalExposure_Scatterplots.pdf"
+    ),
+    combined_exposure,
+    width = 22,
+    height = ceiling(length(plots_for_panel) / 2) * 6
+  )
+}
+
+```
+
+#Combine selected 9 plots for manuscript figure
+# ============================================================
+```{r}
+# ==============================
+# Check order of generated plots
+# ==============================
+
+plot_order <- sig_genus_species %>%
+  mutate(
+    Plot_number = seq_len(n())
+  ) %>%
+  select(
+    Plot_number,
+    Level,
+    Taxa,
+    Behavior,
+    Pvalue
+  )
+
+print(plot_order)
+
+# ============================================================
+# Selected 9 plots for manuscript-style combined figure
+# ============================================================
+
+# Layout:
+#
+# Row 1:
+# Faecalibacterium prausnitzii D | Acetatifactor sp003612485 | Bacteroides thetaiotaomicron
+#
+# Row 2:
+# Eubacterium R | Emergencia | Akkermansia muciniphila - Distance travelled
+#
+# Row 3:
+# Roseburia hominis - Rotarod | Acutalibacter - Rotarod | Akkermansia muciniphila - Time in center
+#
+
+# ============================================================
+# Selected 3 x 3 manuscript figure
+# ============================================================
+
+# Selected plots and desired order
+picture1_order <- c(
+  11, 9, 10,
+   5, 4,  7,
+  12, 3,  8
+)
+
+picture1_plots <- exposure_plots[picture1_order]
+
+# Optimize individual plots for combined figure
+# Optimize individual plots for large combined figure
+picture1_plots <- lapply(
+  picture1_plots,
+  function(p) {
+    p +
+      theme(
+        legend.position = "none",
+
+        # Axis titles
+        axis.title = element_text(
+          size = 24,
+          face = "bold"
+        ),
+
+        # Axis tick labels
+        axis.text = element_text(
+          size = 20,
+          color = "black"
+        ),
+
+        # Taxon vs behavior title
+        plot.title = element_text(
+          size = 25,
+          hjust = 0.5
+        ),
+
+        # Overall rho and p-value
+        plot.subtitle = element_text(
+          size = 21,
+          hjust = 0.5
+        ),
+
+        # CON and Prenatal Exposure rho/p
+        plot.caption = element_text(
+          size = 18,
+          hjust = 0,
+          face = "bold",
+          color = "black"
+        ),
+
+        plot.margin = margin(12, 12, 18, 12)
+      )
+  }
+)
+
+# Extract larger common legend
+picture1_legend <- get_legend(
+  exposure_plots[[7]] +
+    theme(
+      legend.position = "right",
+      legend.title = element_blank(),
+      legend.text = element_text(size = 22),
+      legend.key.size = unit(1.2, "cm")
+    )
+)
+
+# 3 x 3 figure
+picture1_main <- ggarrange(
+  plotlist = picture1_plots,
+  ncol = 3,
+  nrow = 3,
+  labels = LETTERS[1:9],
+  font.label = list(
+    size = 26,
+    face = "bold"
+  ),
+  align = "hv"
+)
+
+# Add common legend
+picture1_final <- ggarrange(
+  picture1_main,
+  picture1_legend,
+  ncol = 2,
+  widths = c(0.91, 0.09)
+)
+
+print(picture1_final)
+
+# Save vector PDF
+ggsave(
+  filename = file.path(
+    exposure_scatter_dir,
+    "Figure_CON_vs_PrenatalExposure_Selected_3x3.pdf"
+  ),
+  plot = picture1_final,
+  width = 34,
+  height = 22,
+  units = "in",
+  limitsize = FALSE
+)
+```
+
+
+
+
+
+
+
