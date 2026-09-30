@@ -1,0 +1,1398 @@
+---
+title: "Microbiome_Maaslin2"
+author: "Deepa Upreti"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# 1. Load packages
+library(phyloseq)
+library(ggplot2)
+library(vegan)
+library(reshape2)
+library(RColorBrewer)
+library(geometry)  
+library(dplyr)
+library(openxlsx)
+library(Maaslin2)
+library(readr)
+library(ggrepel)
+library(readxl)
+library(stringr)
+```
+
+
+```{r}
+# 2. Import count and metadata (fixed version)
+otu_file  <- "taxatable-filtered-absolute_w_taxonomy.txt" 
+
+# Input taxonomy/count table containing raw (unnormalized) microbial counts.
+# The original input filename is retained here for reproducibility.
+
+#Sample metadata
+meta_file <- "metadata.tsv"
+
+# Read file — note: taxonomy is the first column
+taxatable <- read.table(
+  otu_file,
+  header = TRUE,
+  sep = "\t",
+  row.names = 1,
+  check.names = FALSE
+)
+
+head(colnames(taxatable))
+
+#  Remove the "OTU ID" column (second column)
+taxatable <- taxatable[, -1]
+
+#  Extract counts and taxonomy
+otu_counts <- taxatable[, sapply(taxatable, is.numeric)]  # Counts only
+taxonomy_strings <- rownames(taxatable)         # Taxonomy strings are rownames
+
+#  Split taxonomy into hierarchical levels
+tax_split <- data.frame(do.call(rbind, strsplit(taxonomy_strings, ";\\s*")))
+colnames(tax_split) <- c("Kingdom","Phylum","Class","Order","Family","Genus","Species","Strain")[1:ncol(tax_split)]
+rownames(tax_split) <- rownames(otu_counts)
+
+#  Read metadata and align
+meta <- read.table(
+  meta_file,
+  header = TRUE,
+  row.names = 1,
+  sep = "\t",
+  check.names = FALSE
+)
+head(meta)
+
+# Align OTU table and metadata
+common_samples <- intersect(colnames(otu_counts), rownames(meta))
+
+otu_counts <- otu_counts[, common_samples]
+meta <- meta[common_samples, ]
+
+# Recode treatment groups
+meta$SampleType <- recode(
+  meta$SampleType,
+  "Control" = "CON",
+  "PAE"     = "ALC",
+  "CBD"     = "CB",
+  "SAC"     = "ALC+CB"
+)
+
+# Set desired order
+meta$SampleType <- factor(
+  meta$SampleType,
+  levels = c("CON", "ALC", "CB", "ALC+CB")
+)
+
+
+```
+###Phyloseq object
+```{r}
+# 3. Build phyloseq object
+ps <- phyloseq(
+  otu_table(as.matrix(otu_counts), taxa_are_rows = TRUE),
+  tax_table(as.matrix(tax_split)),
+  sample_data(meta)
+)
+
+# Quick check
+ps
+
+# Integrity check
+cat("Number of taxa:", ntaxa(ps), "\n")
+cat("Number of samples:", nsamples(ps), "\n\n")
+
+# Sample names that do not match
+setdiff(sample_names(ps), rownames(sample_data(ps)))
+
+# Confirm sample sums
+summary(sample_sums(ps))
+
+# Confirm OTU table and metadata sample alignment
+identical(sort(sample_names(ps)), sort(rownames(sample_data(ps))))
+```
+#######Maaslin2_Genus############ Used raw counts file
+```{r}
+# 4. QC sample exclusion and Differential Abundance Maaslin2 (Genus) — SEQ13 removed
+# Exclude MICE.SEQ13 based on sequencing QC because of
+# extreme sequencing depth/library-size imbalance.
+
+# ============================================
+#  Remove SEQ13
+# ============================================
+ps_no13 <- prune_samples(sample_names(ps) != "MICE.SEQ13", ps)
+
+cat("Original samples:", nsamples(ps), "\n")
+cat("After removing SEQ13:", nsamples(ps_no13), "\n")
+
+# ============================================
+# 4.1. Agglomerate to Genus
+# ============================================
+ps_genus_no13 <- tax_glom(ps_no13, taxrank = "Genus")
+
+# ============================================
+# Clean genus names
+# ============================================
+genus_vec_no13 <- as.vector(tax_table(ps_genus_no13)[, "Genus"])
+genus_vec_no13 <- gsub("^g__", "", genus_vec_no13)
+genus_vec_no13[is.na(genus_vec_no13) | genus_vec_no13 == ""] <- "Unclassified"
+genus_vec_no13 <- paste0("g_", genus_vec_no13)
+genus_vec_no13 <- make.unique(genus_vec_no13)
+taxa_names(ps_genus_no13) <- genus_vec_no13
+
+# ============================================
+# Build Feature Table (samples x genera)
+# ============================================
+feature_table_no13 <- as(otu_table(ps_genus_no13), "matrix")
+
+# If taxa are rows (taxa x samples), transpose
+if (taxa_are_rows(ps_genus_no13)) {
+  feature_table_no13 <- t(feature_table_no13)
+}
+
+# Remove zero-only genera (columns)
+feature_table_no13 <- feature_table_no13[, colSums(feature_table_no13) > 0, drop = FALSE]
+
+# Force numeric
+mode(feature_table_no13) <- "numeric"
+
+# ============================================
+# Build Clean Metadata (must match ps_genus_no13)
+# ============================================
+metadata_no13 <- data.frame(
+  sampleID     = sample_names(ps_genus_no13),
+  SampleType   = as.factor(as.character(sample_data(ps_genus_no13)$SampleType)),
+  Sex          = as.factor(as.character(sample_data(ps_genus_no13)$Sex)),
+  Dam_Identity = as.factor(as.character(sample_data(ps_genus_no13)$Dam_Identity))
+)
+
+# Set reference levels
+metadata_no13$SampleType <- relevel(metadata_no13$SampleType, ref = "CON")
+metadata_no13$Sex        <- relevel(metadata_no13$Sex, ref = "F")
+
+# Prepare metadata for Maaslin2
+metadata_for_model_no13 <- metadata_no13
+rownames(metadata_for_model_no13) <- metadata_for_model_no13$sampleID
+metadata_for_model_no13$sampleID <- NULL
+
+# Reorder metadata to match feature table rows (samples) — NO13 version
+metadata_for_model_no13 <- metadata_for_model_no13[
+  match(rownames(feature_table_no13), rownames(metadata_for_model_no13)),
+  , drop = FALSE
+]
+
+# Final alignment check — NO13 version
+stopifnot(all(rownames(metadata_for_model_no13) == rownames(feature_table_no13)))
+
+
+# ============================================
+# Sanity Checks
+# ============================================
+cat("Feature table dimensions (samples x genera):\n")
+print(dim(feature_table_no13))
+cat("Metadata dimensions:\n")
+print(dim(metadata_for_model_no13))
+
+cat("SampleType distribution:\n")
+print(table(metadata_for_model_no13$SampleType, useNA="ifany"))
+cat("Sex distribution:\n")
+print(table(metadata_for_model_no13$Sex, useNA="ifany"))
+
+# Confirm SEQ13 is truly gone
+stopifnot(!("MICE.SEQ13" %in% rownames(feature_table_no13)))
+stopifnot(!("MICE.SEQ13" %in% rownames(metadata_for_model_no13)))
+
+
+# Main output folder
+outdir <- file.path("Maaslin2_output_no13", "Genus")
+
+if (dir.exists(outdir)) {
+  unlink(outdir, recursive = TRUE)
+}
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+table(metadata_for_model_no13$SampleType)
+# ============================================
+# Run Maaslin2
+# ============================================
+fit <- Maaslin2(
+  input_data       = feature_table_no13,
+  input_metadata   = metadata_for_model_no13,
+  output           = outdir,
+  fixed_effects    = c("SampleType", "Sex"),
+  random_effects   = c("Dam_Identity"),
+  reference        = c("SampleType,CON", "Sex,F"),
+  normalization    = "TSS",
+  transform        = "LOG",
+  analysis_method  = "LM",
+  min_prevalence   = 0.10,
+  min_abundance    = 0.0001,
+  plot_heatmap     = TRUE,
+  plot_scatter     = FALSE
+)
+
+# ============================================
+# Load Results
+# ============================================
+res_no13 <- read.table(
+  file.path(outdir, "all_results.tsv"),
+  header = TRUE, sep = "\t",
+  stringsAsFactors = FALSE
+)
+res_sig_no13 <- subset(res_no13, qval <= 0.25)
+
+# Quick look
+head(res_no13)
+
+# Additional diagnostics
+summary(res_no13$qval)
+table(res_no13$metadata)
+table(res_no13$metadata, res_no13$qval <= 0.25)
+
+
+# =========================
+#MaAsLin2 Volcano_Genus_no13
+# =========================
+
+res_genus <- read_tsv(file.path(outdir, "all_results.tsv"),
+                      show_col_types = FALSE)
+
+metadata_var <- "SampleType"
+q_cut <- 0.25
+label_top_n <- 17
+
+sig_col <- if ("qval" %in% colnames(res_genus)) "qval" else "pval"
+
+df <- res_genus %>%
+  filter(metadata == metadata_var) %>%
+  mutate(
+    neglog10 = -log10(pmax(.data[[sig_col]], 1e-300)),
+    significance = case_when(
+      .data[[sig_col]] <= q_cut & coef > 0  ~ "Enriched",
+      .data[[sig_col]] <= q_cut & coef < 0  ~ "Depleted",
+      TRUE                                  ~ "Not Significant"
+    )
+  )
+
+# Set facet order
+df$value <- factor(
+  df$value,
+  levels = c("ALC", "CB", "ALC+CB")
+)
+
+# Top taxa per contrast
+label_df <- df %>%
+  filter(.data[[sig_col]] <= q_cut) %>%
+  group_by(value) %>%
+  arrange(.data[[sig_col]], desc(abs(coef))) %>%
+  slice_head(n = label_top_n) %>%
+  ungroup()
+
+label_df$value <- factor(
+  label_df$value,
+  levels = c("ALC", "CB", "ALC+CB")
+)
+
+volcano_colors <- c(
+  "Enriched" = "#D73027",
+  "Depleted" = "#4575B4",
+  "Not Significant" = "grey75"
+)
+
+p <- ggplot(df, aes(x = coef, y = neglog10)) +
+  geom_point(aes(color = significance), size = 2.5, alpha = 0.9) +
+  scale_color_manual(values = volcano_colors) +
+  geom_hline(yintercept = -log10(q_cut), linetype = 2) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  facet_wrap(~ value, scales = "free_y", nrow = 1) +
+  theme_bw(base_size = 16) +
+  theme(
+    panel.grid = element_blank(),
+    legend.title = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    x = "MaAsLin2 coefficient (log-scale effect)",
+    y = paste0("-log10(", sig_col, ")"),
+    title = paste0("Genus-level Differential Abundance (no SEQ13) (qval <= 0.25)")
+  ) +
+  geom_text_repel(
+    data = label_df,
+    aes(label = feature),
+    size = 3.2,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    max.overlaps = Inf
+  )
+
+print(p)
+
+ggsave(
+  file.path(outdir,
+    "Maaslin2_Genus_SampleType_no13_Volcano.pdf"
+  ),
+  p,
+  width = 11,
+  height = 6
+)
+```
+4.2. Class_no13
+
+```{r}
+### Differential Abundance MaAsLin2 (Class) — SEQ13 removed
+
+# ============================================
+# Remove SEQ13
+# ============================================
+ps_no13 <- prune_samples(sample_names(ps) != "MICE.SEQ13", ps)
+
+cat("Original samples:", nsamples(ps), "\n")
+cat("After removing SEQ13:", nsamples(ps_no13), "\n")
+
+# ============================================
+# Agglomerate to Class
+# ============================================
+ps_class_no13 <- tax_glom(ps_no13, taxrank = "Class")
+
+# ============================================
+# Clean class names
+# ============================================
+class_vec_no13 <- as.vector(tax_table(ps_class_no13)[, "Class"])
+class_vec_no13 <- gsub("^c__", "", class_vec_no13)
+class_vec_no13[is.na(class_vec_no13) | class_vec_no13 == ""] <- "Unclassified"
+class_vec_no13 <- paste0("c_", class_vec_no13)
+class_vec_no13 <- make.unique(class_vec_no13)
+taxa_names(ps_class_no13) <- class_vec_no13
+
+# ============================================
+# Build Feature Table (samples x classes)
+# ============================================
+feature_table_no13 <- as(otu_table(ps_class_no13), "matrix")
+
+if (taxa_are_rows(ps_class_no13)) {
+  feature_table_no13 <- t(feature_table_no13)
+}
+
+feature_table_no13 <- feature_table_no13[, colSums(feature_table_no13) > 0, drop = FALSE]
+mode(feature_table_no13) <- "numeric"
+
+# ============================================
+# Build Clean Metadata
+# ============================================
+metadata_no13 <- data.frame(
+  sampleID     = sample_names(ps_class_no13),
+  SampleType   = as.factor(as.character(sample_data(ps_class_no13)$SampleType)),
+  Sex          = as.factor(as.character(sample_data(ps_class_no13)$Sex)),
+  Dam_Identity = as.factor(as.character(sample_data(ps_class_no13)$Dam_Identity))
+)
+
+metadata_no13$SampleType <- relevel(metadata_no13$SampleType, ref = "CON")
+metadata_no13$Sex        <- relevel(metadata_no13$Sex, ref = "F")
+
+metadata_for_model_no13 <- metadata_no13
+rownames(metadata_for_model_no13) <- metadata_for_model_no13$sampleID
+metadata_for_model_no13$sampleID <- NULL
+
+metadata_for_model_no13 <- metadata_for_model_no13[
+  match(rownames(feature_table_no13), rownames(metadata_for_model_no13)),
+  , drop = FALSE
+]
+
+stopifnot(all(rownames(metadata_for_model_no13) == rownames(feature_table_no13)))
+
+# ============================================
+# Sanity Checks
+# ============================================
+cat("Feature table dimensions (samples x classes):\n")
+print(dim(feature_table_no13))
+
+cat("Metadata dimensions:\n")
+print(dim(metadata_for_model_no13))
+
+cat("SampleType distribution:\n")
+print(table(metadata_for_model_no13$SampleType, useNA = "ifany"))
+
+cat("Sex distribution:\n")
+print(table(metadata_for_model_no13$Sex, useNA = "ifany"))
+
+stopifnot(!("MICE.SEQ13" %in% rownames(feature_table_no13)))
+stopifnot(!("MICE.SEQ13" %in% rownames(metadata_for_model_no13)))
+
+# Main output folder
+outdir <- file.path("Maaslin2_output_no13", "Class")
+
+if (dir.exists(outdir)) {
+  unlink(outdir, recursive = TRUE)
+}
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+table(metadata_for_model_no13$SampleType)
+
+# ============================================
+# Run MaAsLin2
+# ============================================
+fit_class <- Maaslin2(
+  input_data       = feature_table_no13,
+  input_metadata   = metadata_for_model_no13,
+  output           = outdir,
+  fixed_effects    = c("SampleType", "Sex"),
+  random_effects   = c("Dam_Identity"),
+  reference        = c("SampleType,CON", "Sex,F"),
+  normalization    = "TSS",
+  transform        = "LOG",
+  analysis_method  = "LM",
+  min_prevalence   = 0.10,
+  min_abundance    = 0.0001,
+  plot_heatmap     = FALSE,
+  plot_scatter     = FALSE
+)
+
+# ============================================
+#  Load Results
+# ============================================
+res_class_no13 <- read.table(
+  file.path(outdir, "all_results.tsv"),
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+res_sig_class_no13 <- subset(res_class_no13, qval <= 0.25)
+
+head(res_class_no13)
+
+summary(res_class_no13$qval)
+table(res_class_no13$metadata)
+table(res_class_no13$metadata, res_class_no13$qval <= 0.25)
+
+# =========================
+# MaAsLin2 Volcano_Class_no13
+# =========================
+
+res_class <- readr::read_tsv(
+  file.path(outdir, "all_results.tsv"),
+  show_col_types = FALSE
+)
+
+metadata_var <- "SampleType"
+q_cut <- 0.25
+label_top_n <- 10
+
+sig_col <- if ("qval" %in% colnames(res_class)) "qval" else "pval"
+
+df <- res_class %>%
+  filter(metadata == metadata_var) %>%
+  mutate(
+    neglog10 = -log10(pmax(.data[[sig_col]], 1e-300)),
+    significance = case_when(
+      .data[[sig_col]] <= q_cut & coef > 0 ~ "Enriched",
+      .data[[sig_col]] <= q_cut & coef < 0 ~ "Depleted",
+      TRUE                                 ~ "Not Significant"
+    )
+  )
+
+df$value <- factor(
+  df$value,
+  levels = c("ALC", "CB", "ALC+CB")
+)
+
+label_df <- df %>%
+  filter(.data[[sig_col]] <= q_cut) %>%
+  group_by(value) %>%
+  arrange(.data[[sig_col]], desc(abs(coef))) %>%
+  slice_head(n = label_top_n) %>%
+  ungroup()
+
+label_df$value <- factor(
+  label_df$value,
+  levels = c("ALC", "CB", "ALC+CB")
+)
+
+volcano_colors <- c(
+  "Enriched" = "#D73027",
+  "Depleted" = "#4575B4",
+  "Not Significant" = "grey75"
+)
+
+p_class <- ggplot(df, aes(x = coef, y = neglog10)) +
+  geom_point(aes(color = significance), size = 2.5, alpha = 0.9) +
+  scale_color_manual(values = volcano_colors) +
+  geom_hline(yintercept = -log10(q_cut), linetype = 2) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  facet_wrap(~ value, scales = "free_y", nrow = 1) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    legend.title = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    x = "MaAsLin2 coefficient (log-scale effect)",
+    y = paste0("-log10(", sig_col, ")"),
+    title = "Class-level Differential Abundance (no SEQ13) (qval <= 0.25)"
+  ) +
+  geom_text_repel(
+    data = label_df,
+    aes(label = feature),
+    size = 3.2,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    max.overlaps = Inf
+  )
+
+print(p_class)
+
+ggsave(
+  file.path(outdir, "Maaslin2_Class_SampleType_no13_Volcano.pdf"),
+  p_class,
+  width = 11,
+  height = 6
+)
+```
+### 4.3. Phylum_no13
+
+```{r}
+### Differential Abundance MaAsLin2 (Phylum) — SEQ13 removed
+
+# ============================================
+#  Remove SEQ13
+# ============================================
+ps_no13 <- prune_samples(sample_names(ps) != "MICE.SEQ13", ps)
+
+cat("Original samples:", nsamples(ps), "\n")
+cat("After removing SEQ13:", nsamples(ps_no13), "\n")
+
+# ============================================
+#  Agglomerate to Phylum
+# ============================================
+ps_phylum_no13 <- tax_glom(ps_no13, taxrank = "Phylum")
+
+# ============================================
+#  Clean phylum names
+# ============================================
+phylum_vec_no13 <- as.vector(tax_table(ps_phylum_no13)[, "Phylum"])
+phylum_vec_no13 <- gsub("^p__", "", phylum_vec_no13)
+phylum_vec_no13[is.na(phylum_vec_no13) | phylum_vec_no13 == ""] <- "Unclassified"
+phylum_vec_no13 <- paste0("p_", phylum_vec_no13)
+phylum_vec_no13 <- make.unique(phylum_vec_no13)
+taxa_names(ps_phylum_no13) <- phylum_vec_no13
+
+# ============================================
+#  Build Feature Table (samples x phyla)
+# ============================================
+feature_table_no13 <- as(otu_table(ps_phylum_no13), "matrix")
+
+if (taxa_are_rows(ps_phylum_no13)) {
+  feature_table_no13 <- t(feature_table_no13)
+}
+
+feature_table_no13 <- feature_table_no13[, colSums(feature_table_no13) > 0, drop = FALSE]
+mode(feature_table_no13) <- "numeric"
+
+# ============================================
+#  Build Clean Metadata
+# ============================================
+metadata_no13 <- data.frame(
+  sampleID     = sample_names(ps_phylum_no13),
+  SampleType   = as.factor(as.character(sample_data(ps_phylum_no13)$SampleType)),
+  Sex          = as.factor(as.character(sample_data(ps_phylum_no13)$Sex)),
+  Dam_Identity = as.factor(as.character(sample_data(ps_phylum_no13)$Dam_Identity))
+)
+
+metadata_no13$SampleType <- relevel(metadata_no13$SampleType, ref = "CON")
+metadata_no13$Sex        <- relevel(metadata_no13$Sex, ref = "F")
+
+metadata_for_model_no13 <- metadata_no13
+rownames(metadata_for_model_no13) <- metadata_for_model_no13$sampleID
+metadata_for_model_no13$sampleID <- NULL
+
+metadata_for_model_no13 <- metadata_for_model_no13[
+  match(rownames(feature_table_no13), rownames(metadata_for_model_no13)),
+  , drop = FALSE
+]
+
+stopifnot(all(rownames(metadata_for_model_no13) == rownames(feature_table_no13)))
+
+# ============================================
+# Sanity Checks
+# ============================================
+cat("Feature table dimensions (samples x phyla):\n")
+print(dim(feature_table_no13))
+
+cat("Metadata dimensions:\n")
+print(dim(metadata_for_model_no13))
+
+cat("SampleType distribution:\n")
+print(table(metadata_for_model_no13$SampleType, useNA = "ifany"))
+
+cat("Sex distribution:\n")
+print(table(metadata_for_model_no13$Sex, useNA = "ifany"))
+
+stopifnot(!("MICE.SEQ13" %in% rownames(feature_table_no13)))
+stopifnot(!("MICE.SEQ13" %in% rownames(metadata_for_model_no13)))
+
+# Main output folder
+outdir <- file.path("Maaslin2_output_no13", "Phylum")
+
+if (dir.exists(outdir)) {
+  unlink(outdir, recursive = TRUE)
+}
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+table(metadata_for_model_no13$SampleType)
+
+# ============================================
+# Run MaAsLin2
+# ============================================
+fit_phylum <- Maaslin2(
+  input_data       = feature_table_no13,
+  input_metadata   = metadata_for_model_no13,
+  output           = outdir,
+  fixed_effects    = c("SampleType", "Sex"),
+  random_effects   = c("Dam_Identity"),
+  reference        = c("SampleType,CON", "Sex,F"),
+  normalization    = "TSS",
+  transform        = "LOG",
+  analysis_method  = "LM",
+  min_prevalence   = 0.10,
+  min_abundance    = 0.0001,
+  plot_heatmap     = FALSE,
+  plot_scatter     = FALSE
+)
+
+# ============================================
+# Load Results
+# ============================================
+res_phylum_no13 <- read.table(
+  file.path(outdir, "all_results.tsv"),
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+res_sig_phylum_no13 <- subset(res_phylum_no13, qval <= 0.25)
+
+head(res_phylum_no13)
+
+summary(res_phylum_no13$qval)
+table(res_phylum_no13$metadata)
+table(res_phylum_no13$metadata, res_phylum_no13$qval <= 0.25)
+
+# =========================
+# MaAsLin2 Volcano_Phylum_no13
+# =========================
+
+res_phylum <- readr::read_tsv(
+  file.path(outdir, "all_results.tsv"),
+  show_col_types = FALSE
+)
+
+metadata_var <- "SampleType"
+q_cut <- 0.25
+label_top_n <- 10
+
+sig_col <- if ("qval" %in% colnames(res_phylum)) "qval" else "pval"
+
+df <- res_phylum %>%
+  filter(metadata == metadata_var) %>%
+  mutate(
+    neglog10 = -log10(pmax(.data[[sig_col]], 1e-300)),
+    significance = case_when(
+      .data[[sig_col]] <= q_cut & coef > 0 ~ "Enriched",
+      .data[[sig_col]] <= q_cut & coef < 0 ~ "Depleted",
+      TRUE                                 ~ "Not Significant"
+    )
+  )
+
+df$value <- factor(
+  df$value,
+  levels = c("ALC", "CB", "ALC+CB")
+)
+
+label_df <- df %>%
+  filter(.data[[sig_col]] <= q_cut) %>%
+  group_by(value) %>%
+  arrange(.data[[sig_col]], desc(abs(coef))) %>%
+  slice_head(n = label_top_n) %>%
+  ungroup()
+
+label_df$value <- factor(
+  label_df$value,
+  levels = c("ALC", "CB", "ALC+CB")
+)
+
+volcano_colors <- c(
+  "Enriched" = "#D73027",
+  "Depleted" = "#4575B4",
+  "Not Significant" = "grey75"
+)
+
+p_phylum <- ggplot(df, aes(x = coef, y = neglog10)) +
+  geom_point(aes(color = significance), size = 2.5, alpha = 0.9) +
+  scale_color_manual(values = volcano_colors) +
+  geom_hline(yintercept = -log10(q_cut), linetype = 2) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  facet_wrap(~ value, scales = "free_y", nrow = 1) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    legend.title = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    x = "MaAsLin2 coefficient (log-scale effect)",
+    y = paste0("-log10(", sig_col, ")"),
+    title = "Phylum-level Differential Abundance (no SEQ13) (qval <= 0.25)"
+  ) +
+  geom_text_repel(
+    data = label_df,
+    aes(label = feature),
+    size = 3.2,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    max.overlaps = Inf
+  )
+
+print(p_phylum)
+
+ggsave(
+  file.path(outdir, "Maaslin2_Phylum_SampleType_no13_Volcano.pdf"),
+  p_phylum,
+  width = 11,
+  height = 6
+)
+```
+
+### 4.4. Species_no13
+```{r}
+### Differential Abundance MaAsLin2 (Species) — SEQ13 removed
+
+# ============================================
+# Remove SEQ13
+# ============================================
+ps_no13 <- prune_samples(sample_names(ps) != "MICE.SEQ13", ps)
+
+cat("Original samples:", nsamples(ps), "\n")
+cat("After removing SEQ13:", nsamples(ps_no13), "\n")
+
+# ============================================
+# Agglomerate to Species
+# ============================================
+ps_species_no13 <- tax_glom(ps_no13, taxrank = "Species")
+
+# ============================================
+#  Clean species names
+# ============================================
+species_vec_no13 <- as.vector(tax_table(ps_species_no13)[, "Species"])
+species_vec_no13 <- gsub("^s__", "", species_vec_no13)
+species_vec_no13[is.na(species_vec_no13) | species_vec_no13 == ""] <- "Unclassified"
+species_vec_no13 <- paste0("s_", species_vec_no13)
+species_vec_no13 <- make.unique(species_vec_no13)
+taxa_names(ps_species_no13) <- species_vec_no13
+
+# ============================================
+# Build Feature Table (samples x species)
+# ============================================
+feature_table_no13 <- as(otu_table(ps_species_no13), "matrix")
+
+if (taxa_are_rows(ps_species_no13)) {
+  feature_table_no13 <- t(feature_table_no13)
+}
+
+feature_table_no13 <- feature_table_no13[, colSums(feature_table_no13) > 0, drop = FALSE]
+mode(feature_table_no13) <- "numeric"
+
+# ============================================
+# Build Clean Metadata
+# ============================================
+metadata_no13 <- data.frame(
+  sampleID     = sample_names(ps_species_no13),
+  SampleType   = as.factor(as.character(sample_data(ps_species_no13)$SampleType)),
+  Sex          = as.factor(as.character(sample_data(ps_species_no13)$Sex)),
+  Dam_Identity = as.factor(as.character(sample_data(ps_species_no13)$Dam_Identity))
+)
+
+metadata_no13$SampleType <- relevel(metadata_no13$SampleType, ref = "CON")
+metadata_no13$Sex        <- relevel(metadata_no13$Sex, ref = "F")
+
+metadata_for_model_no13 <- metadata_no13
+rownames(metadata_for_model_no13) <- metadata_for_model_no13$sampleID
+metadata_for_model_no13$sampleID <- NULL
+
+metadata_for_model_no13 <- metadata_for_model_no13[
+  match(rownames(feature_table_no13), rownames(metadata_for_model_no13)),
+  , drop = FALSE
+]
+
+stopifnot(all(rownames(metadata_for_model_no13) == rownames(feature_table_no13)))
+
+# ============================================
+# Sanity Checks
+# ============================================
+cat("Feature table dimensions (samples x species):\n")
+print(dim(feature_table_no13))
+
+cat("Metadata dimensions:\n")
+print(dim(metadata_for_model_no13))
+
+cat("SampleType distribution:\n")
+print(table(metadata_for_model_no13$SampleType, useNA = "ifany"))
+
+cat("Sex distribution:\n")
+print(table(metadata_for_model_no13$Sex, useNA = "ifany"))
+
+stopifnot(!("MICE.SEQ13" %in% rownames(feature_table_no13)))
+stopifnot(!("MICE.SEQ13" %in% rownames(metadata_for_model_no13)))
+
+# Main output folder
+outdir <- file.path("Maaslin2_output_no13", "Species")
+
+if (dir.exists(outdir)) {
+  unlink(outdir, recursive = TRUE)
+}
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+table(metadata_for_model_no13$SampleType)
+
+# ============================================
+# Run MaAsLin2
+# ============================================
+fit_species <- Maaslin2(
+  input_data       = feature_table_no13,
+  input_metadata   = metadata_for_model_no13,
+  output           = outdir,
+  fixed_effects    = c("SampleType", "Sex"),
+  random_effects   = c("Dam_Identity"),
+  reference        = c("SampleType,CON", "Sex,F"),
+  normalization    = "TSS",
+  transform        = "LOG",
+  analysis_method  = "LM",
+  min_prevalence   = 0.10,
+  min_abundance    = 0.0001,
+  plot_heatmap     = FALSE,
+  plot_scatter     = FALSE
+)
+
+# ============================================
+# Load Results
+# ============================================
+res_species_no13 <- read.table(
+  file.path(outdir, "all_results.tsv"),
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+res_sig_species_no13 <- subset(res_species_no13, qval <= 0.25)
+
+head(res_species_no13)
+
+summary(res_species_no13$qval)
+table(res_species_no13$metadata)
+table(res_species_no13$metadata, res_species_no13$qval <= 0.25)
+
+# =========================
+# MaAsLin2 Volcano_Species_no13
+# =========================
+
+res_species <- readr::read_tsv(
+  file.path(outdir, "all_results.tsv"),
+  show_col_types = FALSE
+)
+
+metadata_var <- "SampleType"
+q_cut <- 0.25
+label_top_n <- 20
+
+sig_col <- if ("qval" %in% colnames(res_species)) "qval" else "pval"
+
+df <- res_species %>%
+  filter(metadata == metadata_var) %>%
+  mutate(
+    neglog10 = -log10(pmax(.data[[sig_col]], 1e-300)),
+    significance = case_when(
+      .data[[sig_col]] <= q_cut & coef > 0 ~ "Enriched",
+      .data[[sig_col]] <= q_cut & coef < 0 ~ "Depleted",
+      TRUE                                 ~ "Not Significant"
+    )
+  )
+
+df$value <- factor(
+  df$value,
+  levels = c("ALC", "CB", "ALC+CB")
+)
+
+label_df <- df %>%
+  filter(.data[[sig_col]] <= q_cut) %>%
+  group_by(value) %>%
+  arrange(.data[[sig_col]], desc(abs(coef))) %>%
+  slice_head(n = label_top_n) %>%
+  ungroup()
+
+label_df$value <- factor(
+  label_df$value,
+  levels = c("ALC", "CB", "ALC+CB")
+)
+
+volcano_colors <- c(
+  "Enriched" = "#D73027",
+  "Depleted" = "#4575B4",
+  "Not Significant" = "grey75"
+)
+
+p_species <- ggplot(df, aes(x = coef, y = neglog10)) +
+  geom_point(aes(color = significance), size = 2.5, alpha = 0.9) +
+  scale_color_manual(values = volcano_colors) +
+  geom_hline(yintercept = -log10(q_cut), linetype = 2) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  facet_wrap(~ value, scales = "free_y", nrow = 1) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    legend.title = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    x = "MaAsLin2 coefficient (log-scale effect)",
+    y = paste0("-log10(", sig_col, ")"),
+    title = "Species-level Differential Abundance (no SEQ13) (qval <= 0.25)"
+  ) +
+  geom_text_repel(
+    data = label_df,
+    aes(label = feature),
+    size = 3.2,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    max.overlaps = Inf
+  )
+
+print(p_species)
+
+ggsave(
+  file.path(outdir, "Maaslin2_Species_SampleType_no13_Volcano.pdf"),
+  p_species,
+  width = 11,
+  height = 6
+)
+```
+
+### 4.5. Family_no13
+```{r}
+### Differential Abundance MaAsLin2 (Family) — SEQ13 removed
+
+# ============================================
+# Remove SEQ13
+# ============================================
+ps_no13 <- prune_samples(sample_names(ps) != "MICE.SEQ13", ps)
+
+cat("Original samples:", nsamples(ps), "\n")
+cat("After removing SEQ13:", nsamples(ps_no13), "\n")
+
+# ============================================
+# Agglomerate to Family
+# ============================================
+ps_family_no13 <- tax_glom(ps_no13, taxrank = "Family")
+
+# ============================================
+# Clean family names
+# ============================================
+family_vec_no13 <- as.vector(tax_table(ps_family_no13)[, "Family"])
+family_vec_no13 <- gsub("^f__", "", family_vec_no13)
+family_vec_no13[is.na(family_vec_no13) | family_vec_no13 == ""] <- "Unclassified"
+family_vec_no13 <- paste0("f_", family_vec_no13)
+family_vec_no13 <- make.unique(family_vec_no13)
+taxa_names(ps_family_no13) <- family_vec_no13
+
+# ============================================
+# Build Feature Table (samples x families)
+# ============================================
+feature_table_no13 <- as(otu_table(ps_family_no13), "matrix")
+
+if (taxa_are_rows(ps_family_no13)) {
+  feature_table_no13 <- t(feature_table_no13)
+}
+
+feature_table_no13 <- feature_table_no13[, colSums(feature_table_no13) > 0, drop = FALSE]
+mode(feature_table_no13) <- "numeric"
+
+# ============================================
+# Build Clean Metadata
+# ============================================
+metadata_no13 <- data.frame(
+  sampleID     = sample_names(ps_family_no13),
+  SampleType   = as.factor(as.character(sample_data(ps_family_no13)$SampleType)),
+  Sex          = as.factor(as.character(sample_data(ps_family_no13)$Sex)),
+  Dam_Identity = as.factor(as.character(sample_data(ps_family_no13)$Dam_Identity))
+)
+
+metadata_no13$SampleType <- relevel(metadata_no13$SampleType, ref = "CON")
+metadata_no13$Sex        <- relevel(metadata_no13$Sex, ref = "F")
+
+metadata_for_model_no13 <- metadata_no13
+rownames(metadata_for_model_no13) <- metadata_for_model_no13$sampleID
+metadata_for_model_no13$sampleID <- NULL
+
+metadata_for_model_no13 <- metadata_for_model_no13[
+  match(rownames(feature_table_no13), rownames(metadata_for_model_no13)),
+  , drop = FALSE
+]
+
+stopifnot(all(rownames(metadata_for_model_no13) == rownames(feature_table_no13)))
+
+# ============================================
+# Sanity Checks
+# ============================================
+cat("Feature table dimensions (samples x families):\n")
+print(dim(feature_table_no13))
+
+cat("Metadata dimensions:\n")
+print(dim(metadata_for_model_no13))
+
+cat("SampleType distribution:\n")
+print(table(metadata_for_model_no13$SampleType, useNA = "ifany"))
+
+cat("Sex distribution:\n")
+print(table(metadata_for_model_no13$Sex, useNA = "ifany"))
+
+stopifnot(!("MICE.SEQ13" %in% rownames(feature_table_no13)))
+stopifnot(!("MICE.SEQ13" %in% rownames(metadata_for_model_no13)))
+
+# Main output folder
+outdir <- file.path("Maaslin2_output_no13", "Family")
+
+if (dir.exists(outdir)) {
+  unlink(outdir, recursive = TRUE)
+}
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+table(metadata_for_model_no13$SampleType)
+
+# ============================================
+# Run MaAsLin2
+# ============================================
+fit_family <- Maaslin2(
+  input_data       = feature_table_no13,
+  input_metadata   = metadata_for_model_no13,
+  output           = outdir,
+  fixed_effects    = c("SampleType", "Sex"),
+  random_effects   = c("Dam_Identity"),
+  reference        = c("SampleType,CON", "Sex,F"),
+  normalization    = "TSS",
+  transform        = "LOG",
+  analysis_method  = "LM",
+  min_prevalence   = 0.10,
+  min_abundance    = 0.0001,
+  plot_heatmap     = FALSE,
+  plot_scatter     = FALSE
+)
+
+# ============================================
+# Load Results
+# ============================================
+res_family_no13 <- read.table(
+  file.path(outdir, "all_results.tsv"),
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+res_sig_family_no13 <- subset(res_family_no13, qval <= 0.25)
+
+head(res_family_no13)
+
+summary(res_family_no13$qval)
+table(res_family_no13$metadata)
+table(res_family_no13$metadata, res_family_no13$qval <= 0.25)
+
+# =========================
+# MaAsLin2 Volcano_Family_no13
+# =========================
+
+res_family <- readr::read_tsv(
+  file.path(outdir, "all_results.tsv"),
+  show_col_types = FALSE
+)
+
+metadata_var <- "SampleType"
+q_cut <- 0.25
+label_top_n <- 10
+
+sig_col <- if ("qval" %in% colnames(res_family)) "qval" else "pval"
+
+df <- res_family %>%
+  filter(metadata == metadata_var) %>%
+  mutate(
+    neglog10 = -log10(pmax(.data[[sig_col]], 1e-300)),
+    significance = case_when(
+      .data[[sig_col]] <= q_cut & coef > 0 ~ "Enriched",
+      .data[[sig_col]] <= q_cut & coef < 0 ~ "Depleted",
+      TRUE                                 ~ "Not Significant"
+    )
+  )
+
+df$value <- factor(
+  df$value,
+  levels = c("ALC", "CB", "ALC+CB")
+)
+
+label_df <- df %>%
+  filter(.data[[sig_col]] <= q_cut) %>%
+  group_by(value) %>%
+  arrange(.data[[sig_col]], desc(abs(coef))) %>%
+  slice_head(n = label_top_n) %>%
+  ungroup()
+
+label_df$value <- factor(
+  label_df$value,
+  levels = c("ALC", "CB", "ALC+CB")
+)
+
+volcano_colors <- c(
+  "Enriched" = "#D73027",
+  "Depleted" = "#4575B4",
+  "Not Significant" = "grey75"
+)
+
+p_family <- ggplot(df, aes(x = coef, y = neglog10)) +
+  geom_point(aes(color = significance), size = 2.5, alpha = 0.9) +
+  scale_color_manual(values = volcano_colors) +
+  geom_hline(yintercept = -log10(q_cut), linetype = 2) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  facet_wrap(~ value, scales = "free_y", nrow = 1) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    legend.title = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    x = "MaAsLin2 coefficient (log-scale effect)",
+    y = paste0("-log10(", sig_col, ")"),
+    title = "Family-level Differential Abundance (no SEQ13) (qval <= 0.25)"
+  ) +
+  geom_text_repel(
+    data = label_df,
+    aes(label = feature),
+    size = 3.2,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    max.overlaps = Inf
+  )
+
+print(p_family)
+
+ggsave(
+  file.path(outdir, "Maaslin2_Family_SampleType_no13_Volcano.pdf"),
+  p_family,
+  width = 11,
+  height = 6
+)
+```
+5. Combine differential abundance results
+```{r}
+
+############################################################
+# Read MaAsLin2 results for each level
+############################################################
+
+base_dir <- "Maaslin2_output_no13"
+
+res_genus   <- read_tsv(file.path(base_dir, "Genus", "all_results.tsv"), show_col_types = FALSE)
+res_class   <- read_tsv(file.path(base_dir, "Class", "all_results.tsv"), show_col_types = FALSE)
+res_phylum  <- read_tsv(file.path(base_dir, "Phylum", "all_results.tsv"), show_col_types = FALSE)
+res_family  <- read_tsv(file.path(base_dir, "Family", "all_results.tsv"), show_col_types = FALSE)
+res_species <- read_tsv(file.path(base_dir, "Species", "all_results.tsv"), show_col_types = FALSE)
+
+############################################################
+# Add taxonomic level labels
+############################################################
+
+res_genus$Level   <- "Genus"
+res_family$Level  <- "Family"
+res_phylum$Level  <- "Phylum"
+res_class$Level   <- "Class"
+res_species$Level <- "Species"
+
+############################################################
+# Combine and keep SampleType associations only
+############################################################
+
+combined <- bind_rows(
+  res_genus,
+  res_family,
+  res_phylum,
+  res_class,
+  res_species
+) %>%
+  filter(metadata == "SampleType") %>%
+  mutate(
+    value = factor(value, levels = c("ALC", "CB", "ALC+CB")),
+    Level = factor(Level, levels = c("Phylum", "Class", "Family", "Genus", "Species")),
+    neglog10 = -log10(pmax(qval, 1e-300)),
+    significance = case_when(
+      qval <= 0.05 ~ "q<=0.05",
+      qval <= 0.10 ~ "q<=0.10",
+      qval <= 0.25 ~ "q<=0.25",
+      TRUE ~ "NS"
+    )
+  ) %>%
+  arrange(Level, value, qval)
+
+############################################################
+# Split by thresholds
+############################################################
+
+res_q05 <- combined %>% filter(qval <= 0.05)
+res_q10 <- combined %>% filter(qval <= 0.10)
+res_q25 <- combined %>% filter(qval <= 0.25)
+
+############################################################
+# Export to Excel inside main output folder
+############################################################
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "All_SampleType_Associations")
+writeData(wb, "All_SampleType_Associations", combined)
+
+addWorksheet(wb, "q_less_0.05")
+writeData(wb, "q_less_0.05", res_q05)
+
+addWorksheet(wb, "q_less_0.10")
+writeData(wb, "q_less_0.10", res_q10)
+
+addWorksheet(wb, "q_less_0.25")
+writeData(wb, "q_less_0.25", res_q25)
+
+saveWorkbook(
+  wb,
+  file.path(base_dir, "Maaslin2_Combined_TaxLevels_SampleType.xlsx"),
+  overwrite = TRUE
+)
+
+cat("Combined multi-level Excel file created successfully.\n")
+```
+
+06. Differential-abundance figures
+
+```{r}
+#### COMBINE VOLCANO PLOT for Phylum, Class, Family, Genus
+
+base_dir <- "Maaslin2_output_no13"
+
+# Read results
+res_genus  <- read_tsv(file.path(base_dir, "Genus", "all_results.tsv"), show_col_types = FALSE)
+res_class  <- read_tsv(file.path(base_dir, "Class", "all_results.tsv"), show_col_types = FALSE)
+res_phylum <- read_tsv(file.path(base_dir, "Phylum", "all_results.tsv"), show_col_types = FALSE)
+res_family <- read_tsv(file.path(base_dir, "Family", "all_results.tsv"), show_col_types = FALSE)
+
+# Add taxonomic level column
+res_genus$Level  <- "Genus"
+res_class$Level  <- "Class"
+res_phylum$Level <- "Phylum"
+res_family$Level <- "Family"
+
+# Combine and keep only SampleType associations
+combined <- bind_rows(
+  res_phylum,
+  res_class,
+  res_family,
+  res_genus
+) %>%
+  filter(metadata == "SampleType") %>%
+  mutate(
+    value = factor(value, levels = c("ALC", "CB", "ALC+CB")),
+    Level = factor(Level, levels = c("Phylum", "Class", "Family", "Genus"))
+  )
+
+# Define significance threshold
+q_cut <- 0.25
+
+# Keep significant only
+combined_sig <- combined %>%
+  filter(qval <= q_cut) %>%
+  mutate(
+    neglog10 = -log10(pmax(qval, 1e-300)),
+    direction = ifelse(coef > 0, "Enriched", "Depleted")
+  )
+
+p <- ggplot(combined_sig, aes(x = coef, y = neglog10)) +
+
+  geom_point(
+    aes(color = Level, shape = direction),
+    size = 4,
+    alpha = 0.9
+  ) +
+
+  geom_hline(
+    yintercept = -log10(q_cut),
+    linetype = 2,
+    linewidth = 0.7,
+    color = "black"
+  ) +
+
+  geom_vline(
+    xintercept = 0,
+    linetype = 2,
+    linewidth = 0.7,
+    color = "black"
+  ) +
+
+  facet_wrap(~ value, scales = "free_y", nrow = 1) +
+
+  scale_color_manual(values = c(
+    "Phylum" = "#1b9e77",
+    "Class"  = "#d95f02",
+    "Family" = "#e7298a",
+    "Genus"  = "#7570b3"
+  )) +
+
+  theme_bw(base_size = 20) +
+
+  theme(
+    panel.grid = element_blank(),
+    legend.title = element_text(face = "bold", size = 20),
+    legend.text = element_text(size = 20),
+    strip.text = element_text(face = "bold", size = 20),
+
+    axis.title = element_text(face = "bold",size = 20),
+
+    axis.text = element_text(size = 17),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 22)
+  ) +
+
+  labs(
+    title = "Differential Abundance Across Taxonomic Levels (no SEQ13)",
+    x = "MaAsLin2 coefficient (log effect size)",
+    y = "-log10(q-value)",
+    color = "Taxonomic level",
+    shape = "Direction"
+  ) +
+
+  geom_text_repel(
+    aes(label = feature),
+    size = 5.0,
+    max.overlaps = Inf,
+    box.padding = 0.4,
+    point.padding = 0.3
+  )
+
+print(p)
+
+ggsave(
+  file.path(base_dir, "Volcano_MultiLevel_SignificantOnly_no13.pdf"),
+  p,
+  width = 20,
+  height = 10
+)
+```
+
+
+```{r}
+sessionInfo()
+```
