@@ -1,6 +1,5 @@
 # PAE_PACE_Microbiome
 # Microbiome Analysis
-
 This repository contains R code used for the microbiome analyses examining long-term gut microbial alterations following prenatal alcohol and/or cannabinoid exposure in mice.
 The repository includes code for sequencing-depth quality control, alpha and beta diversity analyses, differential abundance testing, and associations between microbial taxa and adult behavioral outcomes.
 
@@ -52,8 +51,6 @@ The analysis scripts require microbiome abundance/taxonomy tables and associated
 
 Raw study data are not included in this GitHub repository. Data availability and repository accession information are provided in the associated manuscript.
 
-Users wishing to reproduce the analyses should update the input file paths in the relevant scripts to point to their local copies of the required data files.
-
 ## Statistical analysis
 Microbial community composition was evaluated using Bray-Curtis dissimilarity and PERMANOVA. Pairwise PERMANOVA p-values were adjusted for multiple comparisons using the Benjamini-Hochberg procedure.
 
@@ -63,7 +60,6 @@ Associations between microbial taxa and behavioral outcomes were evaluated using
 
 ## Software
 Analyses were performed primarily in R using packages including:
-
 - phyloseq
 - vegan
 - MaAsLin2
